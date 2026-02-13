@@ -76,6 +76,8 @@ class Runner:
         # model
         if name == "gaussianmixin":
             from skrl.utils.model_instantiators.torch import gaussian_model as component
+        elif name in ["assignmentgaussianmixin", "assignment_gaussian"]:
+            from skrl.utils.model_instantiators.torch import assignment_gaussian_model as component
         elif name == "categoricalmixin":
             from skrl.utils.model_instantiators.torch import categorical_model as component
         elif name == "multicategoricalmixin":

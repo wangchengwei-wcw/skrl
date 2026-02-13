@@ -379,6 +379,19 @@ class Trainer:
                 end_compute_actions = time.perf_counter()
                 t_compute_actions += end_compute_actions - start_compute_actions
 
+                # Inject assignment_probs into environment before step
+                if hasattr(self.agents, '_stacked_assignment_probs') and self.agents._stacked_assignment_probs is not None:
+                    # Access unwrapped environment to set attribute (wrapper __setattr__ doesn't forward)
+                    target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
+                    if hasattr(target_env, '_assignment_probs'):
+                        # Validate assignment_probs before passing to environment
+                        assignment_probs = self.agents._stacked_assignment_probs
+                        if not torch.isfinite(assignment_probs).all():
+                            # If NaN/Inf detected, replace with uniform distribution
+                            N, M, E = assignment_probs.shape
+                            assignment_probs = torch.ones_like(assignment_probs) / E
+                        target_env._assignment_probs = assignment_probs
+
                 # step the environments
                 start_step_env = time.perf_counter()
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
@@ -488,6 +501,19 @@ class Trainer:
                     if self.stochastic_evaluation
                     else {k: outputs[-1][k].get("mean_actions", outputs[0][k]) for k in outputs[-1]}
                 )
+
+                # Inject assignment_probs into environment before step
+                if hasattr(self.agents, '_stacked_assignment_probs') and self.agents._stacked_assignment_probs is not None:
+                    # Access unwrapped environment to set attribute (wrapper __setattr__ doesn't forward)
+                    target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
+                    if hasattr(target_env, '_assignment_probs'):
+                        # Validate assignment_probs before passing to environment
+                        assignment_probs = self.agents._stacked_assignment_probs
+                        if not torch.isfinite(assignment_probs).all():
+                            # If NaN/Inf detected, replace with uniform distribution
+                            N, M, E = assignment_probs.shape
+                            assignment_probs = torch.ones_like(assignment_probs) / E
+                        target_env._assignment_probs = assignment_probs
 
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)

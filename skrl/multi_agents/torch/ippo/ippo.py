@@ -274,16 +274,38 @@ class IPPO(MultiAgent):
 
         # sample stochastic actions
         with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-            data = [
-                self.policies[uid].act({"states": self._state_preprocessor[uid](states[uid])}, role="policy")
-                for uid in self.possible_agents
-            ]
+            data = []
+            for uid in self.possible_agents:
+                pre_states = self._state_preprocessor[uid](states[uid])
+                data.append(
+                    self.policies[uid].act(
+                        {"states": pre_states, "raw_states": states[uid]},
+                        role="policy",
+                    )
+                )
 
             actions = {uid: d[0] for uid, d in zip(self.possible_agents, data)}
             log_prob = {uid: d[1] for uid, d in zip(self.possible_agents, data)}
             outputs = {uid: d[2] for uid, d in zip(self.possible_agents, data)}
 
             self._current_log_prob = log_prob
+
+            # Cache assignment_probs for reward computation
+            # Collect assignment_probs from all agents and stack into [N, M, E] tensor
+            self._current_assignment_probs = {}
+            assignment_probs_list = []
+            for uid in self.possible_agents:
+                if 'assignment_probs' in outputs[uid]:
+                    self._current_assignment_probs[uid] = outputs[uid]['assignment_probs']
+                    assignment_probs_list.append(outputs[uid]['assignment_probs'])
+
+            # Stack into [N, M, E] if available
+            if assignment_probs_list:
+                # assignment_probs_list: list of [N, E] tensors, one per agent
+                # Stack along dim=1 to get [N, M, E]
+                self._stacked_assignment_probs = torch.stack(assignment_probs_list, dim=1)
+            else:
+                self._stacked_assignment_probs = None
 
         return actions, log_prob, outputs
 
@@ -344,16 +366,18 @@ class IPPO(MultiAgent):
                     rewards[uid] += self._discount_factor[uid] * values * truncated[uid]
 
                 # storage transition in memory
-                self.memories[uid].add_samples(
-                    states=states[uid],
-                    actions=actions[uid],
-                    rewards=rewards[uid],
-                    next_states=next_states[uid],
-                    terminated=terminated[uid],
-                    truncated=truncated[uid],
-                    log_prob=self._current_log_prob[uid],
-                    values=values,
-                )
+                memory_samples = {
+                    "states": states[uid],
+                    "actions": actions[uid],
+                    "rewards": rewards[uid],
+                    "next_states": next_states[uid],
+                    "terminated": terminated[uid],
+                    "truncated": truncated[uid],
+                    "log_prob": self._current_log_prob[uid],
+                    "values": values,
+                }
+
+                self.memories[uid].add_samples(**memory_samples)
 
     def pre_interaction(self, timestep: int, timesteps: int) -> None:
         """Callback called before the interaction with the environment
@@ -495,30 +519,34 @@ class IPPO(MultiAgent):
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
+        cumulative_assignment_reg_loss = 0
         cumulative_kl_divergence = 0
         clip_fractions = []
+        has_assignment_reg = hasattr(policy, "get_entropy_regularization")
 
         # learning epochs
         for epoch in range(self._learning_epochs[agent_0]):
             kl_divergences = []
 
             # mini-batches loop
-            for (
-                sampled_states,
-                sampled_actions,
-                sampled_log_prob,
-                sampled_values,
-                sampled_returns,
-                sampled_advantages,
-            ) in sampled_batches_all:
+            for batch in sampled_batches_all:
+
+                (
+                    sampled_states,
+                    sampled_actions,
+                    sampled_log_prob,
+                    sampled_values,
+                    sampled_returns,
+                    sampled_advantages,
+                ) = batch
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
+                    raw_states = sampled_states
                     sampled_states = self._state_preprocessor[agent_0](sampled_states, train=not epoch)
 
-                    _, next_log_prob, _ = policy.act(
-                        {"states": sampled_states, "taken_actions": sampled_actions}, role="policy"
-                    )
+                    policy_inputs = {"states": sampled_states, "raw_states": raw_states, "taken_actions": sampled_actions}
+                    _, next_log_prob, _ = policy.act(policy_inputs, role="policy")
 
                     # compute approximate KL divergence
                     with torch.no_grad():
@@ -535,6 +563,14 @@ class IPPO(MultiAgent):
                         entropy_loss = -self._entropy_loss_scale[agent_0] * policy.get_entropy(role="policy").mean()
                     else:
                         entropy_loss = 0
+
+                    # compute assignment entropy regularization (if available)
+                    assignment_reg_loss = 0
+                    if has_assignment_reg:
+                        try:
+                            assignment_reg_loss = policy.get_entropy_regularization()
+                        except Exception:
+                            assignment_reg_loss = 0
 
                     # compute policy loss
                     ratio = torch.exp(next_log_prob - sampled_log_prob)
@@ -559,7 +595,8 @@ class IPPO(MultiAgent):
 
                 # optimization step
                 self.optimizers[agent_0].zero_grad()
-                self.scaler.scale(policy_loss + entropy_loss + value_loss).backward()
+                total_loss = policy_loss + entropy_loss + value_loss + assignment_reg_loss
+                self.scaler.scale(total_loss).backward()
 
                 if config.torch.is_distributed:
                     policy.reduce_parameters()
@@ -583,6 +620,11 @@ class IPPO(MultiAgent):
                 cumulative_value_loss += value_loss.item()
                 if self._entropy_loss_scale[agent_0]:
                     cumulative_entropy_loss += entropy_loss.item()
+                if has_assignment_reg:
+                    if isinstance(assignment_reg_loss, torch.Tensor):
+                        cumulative_assignment_reg_loss += assignment_reg_loss.item()
+                    else:
+                        cumulative_assignment_reg_loss += float(assignment_reg_loss)
 
             # update learning rate
             if self._learning_rate_scheduler[agent_0]:
@@ -611,6 +653,11 @@ class IPPO(MultiAgent):
                 f"Loss / Entropy loss",
                 cumulative_entropy_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
             )
+        if has_assignment_reg:
+            self.track_data(
+                f"Loss / Assignment reg loss",
+                cumulative_assignment_reg_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
+            )
 
         self.track_data(f"Learning / Standard deviation", policy.distribution(role="policy").stddev.mean().item())
         self.track_data(f"Learning / Explained variance", explained_var)
@@ -619,3 +666,18 @@ class IPPO(MultiAgent):
             self.track_data(f"Learning / Learning rate", self.schedulers[agent_0].get_last_lr()[0])
             if isinstance(self.schedulers[agent_0], KLAdaptiveLR):
                 self.track_data(f"Learning / KL divergence", cumulative_kl_divergence / self._learning_epochs[agent_0])
+
+        # 记录assignment entropy（如果使用AssignmentGaussianModel）
+        if hasattr(policy, 'get_assignment_entropy'):
+            try:
+                assignment_entropy = policy.get_assignment_entropy()
+                self.track_data(f"Assignment / Entropy", assignment_entropy.item())
+
+                # 可选：记录top-1分配的平均概率（越高说明越确定）
+                if hasattr(policy, '_assignment_probs_cache') and policy._assignment_probs_cache is not None:
+                    probs = policy._assignment_probs_cache
+                    top1_prob = probs.max(dim=-1)[0].mean()
+                    self.track_data(f"Assignment / Top1 Probability", top1_prob.item())
+            except Exception as e:
+                # 静默失败，避免影响训练
+                pass
