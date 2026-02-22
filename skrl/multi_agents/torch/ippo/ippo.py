@@ -170,6 +170,26 @@ class IPPO(MultiAgent):
 
         self._mixed_precision = self.cfg["mixed_precision"]
 
+        # distillation configuration
+        self._distill_weight_init = self.cfg.get("distill_weight_init", 0.0)
+        self._distill_anneal_type = self.cfg.get("distill_anneal_type", "linear")
+
+        # Time-based annealing parameters
+        self._distill_anneal_steps = self.cfg.get("distill_anneal_steps", 200000)
+        self._distill_weight_min = self.cfg.get("distill_weight_min", 0.0)
+
+        # KL-adaptive annealing parameters
+        self._distill_target_kl = self.cfg.get("distill_target_kl", 0.1)
+        self._distill_kl_ema_momentum = self.cfg.get("distill_kl_ema_momentum", 0.99)
+        self._distill_kl_ema = None  # 指数移动平均的KL（每个update只更新一次）
+        self._distill_initial_kl = None  # 初始KL（用于kl_ratio）
+        self._cached_distill_weight = self._distill_weight_init  # 缓存的权重，mini-batch中使用
+
+        # routing regularization configuration
+        self._routing_reg_weight = self.cfg.get("routing_reg_weight", 0.01)
+
+        self._optimal_assignment_sorted = None  # [N, M, K_target] from trainer
+
         # set up automatic mixed precision
         self._device_type = torch.device(device).type
         if version.parse(torch.__version__) >= version.parse("2.4"):
@@ -251,9 +271,94 @@ class IPPO(MultiAgent):
                 # tensors sampled during training
                 self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages"]
 
+                # distillation: create tensor for optimal assignment if enabled
+                if self._distill_weight_init > 0:
+                    # num_targets from policy config (default 5)
+                    num_targets = 5
+                    if hasattr(self.policies[uid], 'num_targets'):
+                        num_targets = self.policies[uid].num_targets
+                    self._distill_num_targets = num_targets
+                    self.memories[uid].create_tensor(name="optimal_assignment", size=num_targets, dtype=torch.float32)
+                    self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages", "optimal_assignment"]
+
+        # Validate distillation configuration
+        if self._distill_weight_init > 0:
+            logger.info("Distillation enabled, validating configuration...")
+            for uid in self.possible_agents:
+                policy = self.policies[uid]
+                if hasattr(policy, 'num_targets') and hasattr(policy, 'obs_k_target'):
+                    num_targets = policy.num_targets
+                    obs_k_target = policy.obs_k_target
+                    if num_targets != obs_k_target:
+                        logger.warning(
+                            f"Agent {uid}: num_targets ({num_targets}) != obs_k_target ({obs_k_target}). "
+                            f"This may cause suboptimal distillation. Recommend setting both to same value in config."
+                        )
+                    else:
+                        logger.info(f"Agent {uid}: num_targets == obs_k_target == {num_targets} ✓")
+
         # create temporary variables needed for storage and computation
         self._current_log_prob = []
         self._current_next_states = []
+
+    def _update_distill_ema(self, avg_raw_kl: float):
+        """每个update结束时调用一次,用本次update的平均raw KL来更新KL的EMA(指数滑动平均)。
+
+        Args:
+            avg_raw_kl: 本次update中所有mini-batch的原始KL平均值
+        """
+        if self._distill_weight_init <= 0:
+            return
+
+        # 记录初始KL（用于kl_ratio）
+        if self._distill_initial_kl is None:
+            self._distill_initial_kl = avg_raw_kl
+
+        # 更新KL的指数移动平均（每个update只更新一次）
+        # ema = momentum * ema + (1 - momentum) * KL
+        if self._distill_kl_ema is None:
+            self._distill_kl_ema = avg_raw_kl
+        else:
+            self._distill_kl_ema = (
+                self._distill_kl_ema_momentum * self._distill_kl_ema +
+                (1 - self._distill_kl_ema_momentum) * avg_raw_kl
+            )
+
+    def _compute_distill_weight(self, timestep: int) -> float:
+        """纯函数:根据当前EMA状态计算蒸馏权重,不修改任何状态。
+
+        Args:
+            timestep: 当前训练步数
+
+        Returns:
+            蒸馏权重
+        """
+        # TODO：这里的自适应退火是否有更加合理的设计？或者权重降低更加合理？
+        if self._distill_weight_init <= 0:
+            return 0.0
+
+        if self._distill_anneal_type == "kl_adaptive":
+            if self._distill_kl_ema is None:
+                return self._distill_weight_init
+            if self._distill_kl_ema > self._distill_target_kl:
+                return self._distill_weight_init
+            else:
+                progress = (self._distill_target_kl - self._distill_kl_ema) / self._distill_target_kl
+                progress = max(0.0, min(1.0, progress))
+                return self._distill_weight_init * max(self._distill_weight_min, 1.0 - progress)
+        elif self._distill_anneal_type == "hybrid":
+            time_factor = max(0.0, 1.0 - timestep / self._distill_anneal_steps)
+            if self._distill_kl_ema is not None and self._distill_initial_kl is not None:
+                kl_factor = min(1.0, self._distill_kl_ema / max(self._distill_initial_kl, 1e-8))
+                kl_factor = max(self._distill_weight_min, kl_factor)
+            else:
+                kl_factor = 1.0
+            return self._distill_weight_init * min(time_factor, kl_factor)
+        elif self._distill_anneal_type == "linear":
+            progress = min(timestep / self._distill_anneal_steps, 1.0)
+            return self._distill_weight_init * max(0.0, 1.0 - progress)
+        else:
+            raise ValueError(f"Unknown distill_anneal_type: {self._distill_anneal_type}")
 
     def act(self, states: Mapping[str, torch.Tensor], timestep: int, timesteps: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, Any]]:
         """Process the environment's states to make a decision (actions) using the main policies
@@ -376,6 +481,12 @@ class IPPO(MultiAgent):
                     "log_prob": self._current_log_prob[uid],
                     "values": values,
                 }
+
+                # distillation: store optimal assignment per agent
+                if self._distill_weight_init > 0 and self._optimal_assignment_sorted is not None:
+                    agent_idx = self.possible_agents.index(uid)
+                    # _optimal_assignment_sorted: [N, M, K_target] → take agent_idx slice → [N, K_target]
+                    memory_samples["optimal_assignment"] = self._optimal_assignment_sorted[:, agent_idx, :]
 
                 self.memories[uid].add_samples(**memory_samples)
 
@@ -519,8 +630,12 @@ class IPPO(MultiAgent):
         cumulative_policy_loss = 0
         cumulative_entropy_loss = 0
         cumulative_value_loss = 0
-        cumulative_assignment_reg_loss = 0
         cumulative_kl_divergence = 0
+        cumulative_assignment_reg_loss = 0
+        cumulative_distill_loss = 0
+        cumulative_raw_kl = 0               # 原始KL散度（未加权）
+        cumulative_routing_loss = 0         # 路由正则化损失
+        distill_count = 0                   # 实际计算了KL的batch数
         clip_fractions = []
         has_assignment_reg = hasattr(policy, "get_entropy_regularization")
 
@@ -531,14 +646,26 @@ class IPPO(MultiAgent):
             # mini-batches loop
             for batch in sampled_batches_all:
 
-                (
-                    sampled_states,
-                    sampled_actions,
-                    sampled_log_prob,
-                    sampled_values,
-                    sampled_returns,
-                    sampled_advantages,
-                ) = batch
+                sampled_optimal_assignment = None
+                if self._distill_weight_init > 0 and len(batch) == 7:
+                    (
+                        sampled_states,
+                        sampled_actions,
+                        sampled_log_prob,
+                        sampled_values,
+                        sampled_returns,
+                        sampled_advantages,
+                        sampled_optimal_assignment,
+                    ) = batch
+                else:
+                    (
+                        sampled_states,
+                        sampled_actions,
+                        sampled_log_prob,
+                        sampled_values,
+                        sampled_returns,
+                        sampled_advantages,
+                    ) = batch
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
 
@@ -564,7 +691,8 @@ class IPPO(MultiAgent):
                     else:
                         entropy_loss = 0
 
-                    # compute assignment entropy regularization (if available)
+                    # compute assignment entropy regularization
+                    # 让 assignment_probs 更“硬”、更果断地选某个目标
                     assignment_reg_loss = 0
                     if has_assignment_reg:
                         try:
@@ -593,9 +721,61 @@ class IPPO(MultiAgent):
                         )
                     value_loss = self._value_loss_scale[agent_0] * F.mse_loss(sampled_returns, predicted_values)
 
+                    # compute distillation loss (Sinkhorn optimal assignment → attention assignment)
+                    # 用 teacher（Sinkhorn 算出来的"最优目标分配分布"）去监督 student（你注意力模块输出的 assignment_probs），让 student 在训练早期更快学会"怎么分配目标"。
+                    distill_loss = 0
+                    if self._distill_weight_init > 0 and sampled_optimal_assignment is not None:
+                        # get current assignment_probs from cached policy output
+                        assignment_probs = getattr(policy, '_assignment_probs_cache', None)
+                        if assignment_probs is not None:
+                            # KL divergence: target distribution (Sinkhorn) vs learned distribution
+                            target = sampled_optimal_assignment  # [B, K_target]
+                            pred = assignment_probs              # [B, E]
+
+                            # Handle dimension mismatch (K_target != E)
+                            K_target = target.shape[-1]
+                            E = pred.shape[-1]
+
+                            if K_target != E:
+                                logger.warning(
+                                    f"Dimension mismatch in distillation: K_target={K_target}, E={E}. "
+                                    f"This should not happen if config is correct (num_targets should equal obs_k_target). "
+                                    f"Applying fallback padding/truncation, but this may cause information loss."
+                                )
+                                if K_target < E:
+                                    # Pad target with zeros
+                                    pad_size = E - K_target
+                                    pad = torch.zeros(target.shape[0], pad_size, device=target.device, dtype=target.dtype)
+                                    target = torch.cat([target, pad], dim=-1)
+                                else:
+                                    # Truncate target to match E
+                                    target = target[:, :E]
+
+                            # normalize target to valid distribution (may not sum to 1 due to masking)
+                            target_sum = target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                            target = target / target_sum
+
+                            # KL(target || learned) = Σ target * log(target / learned)
+                            log_pred = torch.log(pred + 1e-8)
+                            log_target = torch.log(target + 1e-8)
+                            raw_kl_val = (target * (log_target - log_pred)).sum(dim=-1).mean()
+
+                            # 使用缓存的权重（上一次update结束时计算的，不更新EMA）
+                            distill_loss = self._cached_distill_weight * raw_kl_val
+
+                    # compute routing specialization loss (encourage peaked routing weights)
+                    routing_loss = 0
+                    routing_weights = getattr(policy, '_routing_weights_cache', None)
+                    if routing_weights is not None and hasattr(self, '_routing_reg_weight'):
+                        # Encourage routing weights to be peaked (not uniform)
+                        # Use negative entropy: lower entropy = more peaked distribution
+                        routing_entropy = -(routing_weights * torch.log(routing_weights + 1e-8)).sum(dim=-1).mean()
+                        routing_loss = self._routing_reg_weight * routing_entropy
+
                 # optimization step
+                # NOTE：这新加的两个loss项是否会起到共同推进的作用，还是相互干扰的作用？
                 self.optimizers[agent_0].zero_grad()
-                total_loss = policy_loss + entropy_loss + value_loss + assignment_reg_loss
+                total_loss = policy_loss + entropy_loss + value_loss + assignment_reg_loss + distill_loss + routing_loss
                 self.scaler.scale(total_loss).backward()
 
                 if config.torch.is_distributed:
@@ -625,6 +805,12 @@ class IPPO(MultiAgent):
                         cumulative_assignment_reg_loss += assignment_reg_loss.item()
                     else:
                         cumulative_assignment_reg_loss += float(assignment_reg_loss)
+                if isinstance(distill_loss, torch.Tensor):
+                    cumulative_distill_loss += distill_loss.item()
+                    cumulative_raw_kl += raw_kl_val.item()
+                    distill_count += 1
+                if isinstance(routing_loss, torch.Tensor):
+                    cumulative_routing_loss += routing_loss.item()
 
             # update learning rate
             if self._learning_rate_scheduler[agent_0]:
@@ -655,9 +841,38 @@ class IPPO(MultiAgent):
             )
         if has_assignment_reg:
             self.track_data(
-                f"Loss / Assignment reg loss",
+                f"Distillation / Loss_Assignment reg loss",
                 cumulative_assignment_reg_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
             )
+        if self._distill_weight_init > 0:
+            avg_raw_kl = cumulative_raw_kl / max(distill_count, 1)
+            avg_weighted_loss = cumulative_distill_loss / max(distill_count, 1)
+
+            if distill_count > 0:
+                self._update_distill_ema(avg_raw_kl)
+
+            self._cached_distill_weight = self._compute_distill_weight(timestep)
+
+            self.track_data(f"Distillation / Loss_Distillation loss (raw KL)", avg_raw_kl) # teacher 和 student 分配分布的 真实差距（纯 KL），不乘权重。student 当前跟 teacher 像不像（越小越像）。
+            self.track_data(f"Distillation / Loss_Distillation loss (weighted)", avg_weighted_loss) # 真正加进你 total_loss 里参与反向传播的蒸馏损失项。蒸馏这一项在总 loss 里到底贡献了多大（梯度强不强）
+            self.track_data(f"Distillation / Loss_Distillation weight", self._cached_distill_weight)
+
+            if self._distill_kl_ema is not None:
+                self.track_data(f"Distillation / KL EMA", self._distill_kl_ema)
+            if self._distill_target_kl > 0:
+                self.track_data(f"Distillation / Target KL", self._distill_target_kl)
+
+        # Track routing loss
+        if cumulative_routing_loss > 0:
+            avg_routing_loss = cumulative_routing_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0])
+            self.track_data(f"Routing / Loss_Routing specialization loss", avg_routing_loss)
+
+        # Track routing weights (if available)
+        if hasattr(policy, '_routing_weights_cache') and policy._routing_weights_cache is not None:
+            routing_weights = policy._routing_weights_cache
+            self.track_data(f"Routing / Team Assignment Weight", routing_weights[:, 0].mean().item())
+            self.track_data(f"Routing / Collision Avoidance Weight", routing_weights[:, 1].mean().item())
+            self.track_data(f"Routing / Uncertainty Weight", routing_weights[:, 2].mean().item())
 
         self.track_data(f"Learning / Standard deviation", policy.distribution(role="policy").stddev.mean().item())
         self.track_data(f"Learning / Explained variance", explained_var)
@@ -667,17 +882,16 @@ class IPPO(MultiAgent):
             if isinstance(self.schedulers[agent_0], KLAdaptiveLR):
                 self.track_data(f"Learning / KL divergence", cumulative_kl_divergence / self._learning_epochs[agent_0])
 
-        # 记录assignment entropy（如果使用AssignmentGaussianModel）
         if hasattr(policy, 'get_assignment_entropy'):
             try:
                 assignment_entropy = policy.get_assignment_entropy()
+                # 太高：分配犹豫，可能 entropy_reg_weight 太小/冲突惩罚太大/输入信息不足。太低：过早“硬分配”，可能 entropy_reg_weight 太大导致过拟合到单目标（或抢目标）
                 self.track_data(f"Assignment / Entropy", assignment_entropy.item())
 
-                # 可选：记录top-1分配的平均概率（越高说明越确定）
+                # 记录top-1分配的平均概率（越高说明越确定）
                 if hasattr(policy, '_assignment_probs_cache') and policy._assignment_probs_cache is not None:
                     probs = policy._assignment_probs_cache
                     top1_prob = probs.max(dim=-1)[0].mean()
                     self.track_data(f"Assignment / Top1 Probability", top1_prob.item())
             except Exception as e:
-                # 静默失败，避免影响训练
                 pass

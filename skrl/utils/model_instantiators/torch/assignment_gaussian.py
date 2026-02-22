@@ -29,7 +29,13 @@ def assignment_gaussian_model(
     # Assignment module parameters
     assignment_embed_dim: int = 64,
     num_targets: int = 5,
+    obs_k_friends: int = 4,
+    obs_k_target: int = 5,
+    obs_k_friend_targetpos: int = 5,
     entropy_reg_weight: float = 0.01,
+    conflict_penalty_weight: float = 1.0,
+    num_heads: int = 4,
+    use_quaternion: bool = True,
     # Control MLP parameters
     mlp_layers: list = None,
     return_source: bool = False,
@@ -37,10 +43,13 @@ def assignment_gaussian_model(
     **kwargs,
 ) -> Union[Model, str]:
     """
-    Instantiate an assignment-augmented Gaussian policy model.
+    Instantiate an optimized assignment-augmented Gaussian policy model.
 
-    This model includes a differentiable target assignment module that learns
-    to softly assign targets to agents using attention mechanism.
+    This model includes a differentiable target assignment module with:
+    - Multi-head attention mechanism
+    - Enhanced query features (with quaternion support)
+    - Improved teammate coordination
+    - Non-linear conflict penalty
 
     Args:
         observation_space: Observation/state space or shape (default: None).
@@ -58,7 +67,13 @@ def assignment_gaussian_model(
         fixed_log_std: Whether to fix log std (no gradient) (default: False)
         assignment_embed_dim: Embedding dimension for assignment module (default: 64)
         num_targets: Number of enemy targets (default: 5)
+        obs_k_friends: Max number of friends in observation (default: 4)
+        obs_k_target: Number of targets in observation (default: 5)
+        obs_k_friend_targetpos: Number of friend target positions in observation (default: 5)
         entropy_reg_weight: Weight for entropy regularization (default: 0.01)
+        conflict_penalty_weight: Weight for penalizing assignment conflicts (default: 1.0)
+        num_heads: Number of attention heads (default: 4)
+        use_quaternion: Whether to use quaternion for enhanced query features (default: True)
         mlp_layers: Hidden layer sizes for control MLP (default: [512, 256, 128, 64])
         return_source: Whether to return source code instead of model instance (default: False)
 
@@ -73,6 +88,9 @@ def assignment_gaussian_model(
         ...     assignment_embed_dim=64,
         ...     num_targets=5,
         ...     entropy_reg_weight=0.01,
+        ...     conflict_penalty_weight=1.0,
+        ...     num_heads=4,
+        ...     use_quaternion=True,
         ...     mlp_layers=[512, 256, 128, 64]
         ... )
     """
@@ -95,6 +113,12 @@ def assignment_gaussian_model(
         fixed_log_std=fixed_log_std,
         assignment_embed_dim=assignment_embed_dim,
         num_targets=num_targets,
+        obs_k_friends=obs_k_friends,
+        obs_k_target=obs_k_target,
+        obs_k_friend_targetpos=obs_k_friend_targetpos,
         entropy_reg_weight=entropy_reg_weight,
+        conflict_penalty_weight=conflict_penalty_weight,
+        num_heads=num_heads,
+        use_quaternion=use_quaternion,
         mlp_layers=mlp_layers,
     )

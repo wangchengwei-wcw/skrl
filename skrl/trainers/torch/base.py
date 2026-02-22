@@ -386,11 +386,24 @@ class Trainer:
                     if hasattr(target_env, '_assignment_probs'):
                         # Validate assignment_probs before passing to environment
                         assignment_probs = self.agents._stacked_assignment_probs
+
+                        # Check for NaN/Inf
                         if not torch.isfinite(assignment_probs).all():
                             # If NaN/Inf detected, replace with uniform distribution
                             N, M, E = assignment_probs.shape
                             assignment_probs = torch.ones_like(assignment_probs) / E
-                        target_env._assignment_probs = assignment_probs
+                            logger.warning("Assignment probs contain NaN/Inf, replaced with uniform distribution")
+
+                        # Check dimension match
+                        expected_shape = (target_env.num_envs, target_env.M, target_env.E)
+                        if assignment_probs.shape != expected_shape:
+                            logger.error(
+                                f"Assignment probs shape mismatch: got {assignment_probs.shape}, "
+                                f"expected {expected_shape}. Skipping injection."
+                            )
+                            target_env._assignment_probs = None
+                        else:
+                            target_env._assignment_probs = assignment_probs
 
                 # step the environments
                 start_step_env = time.perf_counter()
@@ -400,6 +413,12 @@ class Trainer:
                 infos["shared_next_states"] = shared_next_states
                 end_step_env = time.perf_counter()
                 t_step_env += end_step_env - start_step_env
+
+                # Read optimal assignment from environment for distillation
+                target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
+                if hasattr(target_env, '_optimal_assignment_sorted') and target_env._optimal_assignment_sorted is not None:
+                    if hasattr(self.agents, '_optimal_assignment_sorted'):
+                        self.agents._optimal_assignment_sorted = target_env._optimal_assignment_sorted
 
                 # render scene
                 if not self.headless:
@@ -509,11 +528,24 @@ class Trainer:
                     if hasattr(target_env, '_assignment_probs'):
                         # Validate assignment_probs before passing to environment
                         assignment_probs = self.agents._stacked_assignment_probs
+
+                        # Check for NaN/Inf
                         if not torch.isfinite(assignment_probs).all():
                             # If NaN/Inf detected, replace with uniform distribution
                             N, M, E = assignment_probs.shape
                             assignment_probs = torch.ones_like(assignment_probs) / E
-                        target_env._assignment_probs = assignment_probs
+                            logger.warning("Assignment probs contain NaN/Inf, replaced with uniform distribution")
+
+                        # Check dimension match
+                        expected_shape = (target_env.num_envs, target_env.M, target_env.E)
+                        if assignment_probs.shape != expected_shape:
+                            logger.error(
+                                f"Assignment probs shape mismatch: got {assignment_probs.shape}, "
+                                f"expected {expected_shape}. Skipping injection."
+                            )
+                            target_env._assignment_probs = None
+                        else:
+                            target_env._assignment_probs = assignment_probs
 
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
