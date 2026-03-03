@@ -33,7 +33,6 @@ def assignment_gaussian_model(
     obs_k_target: int = 5,
     obs_k_friend_targetpos: int = 5,
     entropy_reg_weight: float = 0.01,
-    conflict_penalty_weight: float = 1.0,
     num_heads: int = 4,
     use_quaternion: bool = True,
     # Control MLP parameters
@@ -71,7 +70,6 @@ def assignment_gaussian_model(
         obs_k_target: Number of targets in observation (default: 5)
         obs_k_friend_targetpos: Number of friend target positions in observation (default: 5)
         entropy_reg_weight: Weight for entropy regularization (default: 0.01)
-        conflict_penalty_weight: Weight for penalizing assignment conflicts (default: 1.0)
         num_heads: Number of attention heads (default: 4)
         use_quaternion: Whether to use quaternion for enhanced query features (default: True)
         mlp_layers: Hidden layer sizes for control MLP (default: [512, 256, 128, 64])
@@ -88,7 +86,6 @@ def assignment_gaussian_model(
         ...     assignment_embed_dim=64,
         ...     num_targets=5,
         ...     entropy_reg_weight=0.01,
-        ...     conflict_penalty_weight=1.0,
         ...     num_heads=4,
         ...     use_quaternion=True,
         ...     mlp_layers=[512, 256, 128, 64]
@@ -117,7 +114,6 @@ def assignment_gaussian_model(
         obs_k_target=obs_k_target,
         obs_k_friend_targetpos=obs_k_friend_targetpos,
         entropy_reg_weight=entropy_reg_weight,
-        conflict_penalty_weight=conflict_penalty_weight,
         num_heads=num_heads,
         use_quaternion=use_quaternion,
         mlp_layers=mlp_layers,

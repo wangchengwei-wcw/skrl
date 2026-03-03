@@ -405,6 +405,12 @@ class Trainer:
                         else:
                             target_env._assignment_probs = assignment_probs
 
+                # Sync distill_enabled flag to env (skip Sinkhorn when weight has annealed to 0)
+                if hasattr(self.agents, '_cached_distill_weight') and hasattr(self.agents, '_distill_weight_init'):
+                    _target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
+                    if hasattr(_target_env, '_distill_enabled'):
+                        _target_env._distill_enabled = self.agents._cached_distill_weight > 0
+
                 # step the environments
                 start_step_env = time.perf_counter()
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
