@@ -411,6 +411,15 @@ class Trainer:
                     if hasattr(_target_env, '_distill_enabled'):
                         _target_env._distill_enabled = self.agents._cached_distill_weight > 0
 
+                # Sync hard assignment reward flag to env
+                if hasattr(self.agents, '_margin_reg_update_count'):
+                    _target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
+                    if hasattr(_target_env, '_use_hard_assignment_reward'):
+                        reg_warmup = self.agents.cfg.get("assignment_reg_warmup_updates", 0)
+                        _target_env._use_hard_assignment_reward = (
+                            reg_warmup > 0 and self.agents._margin_reg_update_count >= reg_warmup
+                        )
+
                 # step the environments
                 start_step_env = time.perf_counter()
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)
@@ -552,6 +561,15 @@ class Trainer:
                             target_env._assignment_probs = None
                         else:
                             target_env._assignment_probs = assignment_probs
+
+                # Sync hard assignment reward flag to env
+                if hasattr(self.agents, '_margin_reg_update_count'):
+                    _target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
+                    if hasattr(_target_env, '_use_hard_assignment_reward'):
+                        reg_warmup = self.agents.cfg.get("assignment_reg_warmup_updates", 0)
+                        _target_env._use_hard_assignment_reward = (
+                            reg_warmup > 0 and self.agents._margin_reg_update_count >= reg_warmup
+                        )
 
                 # step the environments
                 next_states, rewards, terminated, truncated, infos = self.env.step(actions)

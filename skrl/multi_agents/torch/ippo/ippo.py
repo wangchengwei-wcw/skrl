@@ -1,4 +1,3 @@
-# BUG：现在如果是接着上一个checkpoint继续训练，蒸馏权重会变成yaml里的初始值，而不是上一个checkpoint里已经退火到的值。接着训练的话，他还是会继续走那个warmup还得继续收集数据。
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import copy
@@ -76,7 +75,7 @@ class IPPO(MultiAgent):
         _KEYS = [
             "_distill_kl_ema",
             "_distill_kl_ema_prev",
-            "_distill_initial_kl",
+            "_distill_peak_kl",
             "_cached_distill_weight",
             "_distill_entropy_ema",
             "_distill_entropy_ema_prev",
@@ -91,20 +90,51 @@ class IPPO(MultiAgent):
             "_distill_perf_slow",
             "_distill_perf_best",
             "_margin_reg_update_count",
+            "_distill_latest_intercept_rate",
+            "_distill_latest_success_rate",
+            "_distill_total_timestep",
+            "_distill_zero_streak",
+            "_distill_permanently_off",
         ]
 
         def __init__(self, agent):
             super().__init__()
             self._agent = agent
 
-        def state_dict(self, *args, **kwargs):
-            return {k: getattr(self._agent, k) for k in self._KEYS}
+        def get_extra_state(self):
+            state = {}
+            for k in self._KEYS:
+                v = getattr(self._agent, k, None)
+                # 张量断开图并转 CPU，避免无意义图/设备问题
+                if isinstance(v, torch.Tensor):
+                    v = v.detach().cpu()
+                state[k] = v
+            return state
 
-        def load_state_dict(self, state, strict=True):
-            for k, v in state.items():
-                if k in self._KEYS:
-                    setattr(self._agent, k, v)
-            return {}
+        def set_extra_state(self, state):
+            if state is None:
+                return
+
+            for k in self._KEYS:
+                if k not in state:
+                    continue
+                v = state[k]
+                # 如果是 tensor，按当前 agent.device 放回去
+                if isinstance(v, torch.Tensor):
+                    v = v.to(self._agent.device)
+                setattr(self._agent, k, v)
+
+            # 防御性修正：避免旧 ckpt 缺字段时出现非法状态
+            if getattr(self._agent, "_cached_distill_weight", None) is None:
+                self._agent._cached_distill_weight = self._agent._distill_weight_init
+            self._agent._cached_distill_weight = float(
+                min(
+                    self._agent._distill_weight_init,
+                    max(self._agent._distill_weight_min, self._agent._cached_distill_weight)
+                )
+            )
+            if getattr(self._agent, "_distill_total_timestep", None) is None:
+                self._agent._distill_total_timestep = 0
 
     def __init__(
         self,
@@ -218,7 +248,7 @@ class IPPO(MultiAgent):
         self._distill_target_kl = self.cfg.get("distill_target_kl", 0.1)                # KL-adaptive退火的目标KL散度，低于此值开始退火。学生要"学到多像老师"才开始放手？
         self._distill_kl_ema_momentum = self.cfg.get("distill_kl_ema_momentum", 0.99)   # KL指数移动平均的动量（平滑）。用多平滑的KL来判断"学到位了"？
         self._distill_kl_ema = None                                                     # 指数移动平均的KL（每个update只更新一次）
-        self._distill_initial_kl = None                                                 # 初始KL（用于kl_ratio）
+        self._distill_peak_kl = None                                                 # 最高KL（用于kl_ratio）
         self._cached_distill_weight = self._distill_weight_init                         # 缓存的权重，mini-batch中使用
 
         # ITAD (Information-Theoretic Adaptive Distillation) parameters
@@ -231,11 +261,12 @@ class IPPO(MultiAgent):
         self._distill_info_gain_baseline = None                                             # 信息增益的基准值（前几次的平均）
         self._distill_info_gain_warmup = 0                                                  # warmup 计数器
         self._distill_info_gain_warmup_n = self.cfg.get("distill_info_gain_warmup_n", 5)    # warmup 次数
+        self._distill_v2_warmup_steps = self.cfg.get("distill_v2_warmup_steps", 50000)      # itad_v2 预热步数
 
         # ITAD退步检测：多指标 + 双EMA
         self._distill_perf_metric_key = self.cfg.get("distill_perf_metric_key", "log")  # infos中的key
         self._distill_perf_fast_momentum = self.cfg.get("distill_perf_fast_momentum", 0.95)   # 快EMA（短期）
-        self._distill_perf_slow_momentum = self.cfg.get("distill_perf_slow_momentum", 0.995)  # 慢EMA（长期）
+        self._distill_perf_slow_momentum = self.cfg.get("distill_perf_slow_momentum", 0.98)   # 慢EMA（长期）
         self._distill_perf_weights = self.cfg.get("distill_perf_weights", {
             "reward": 0.3,
             "interception": 0.5,
@@ -254,9 +285,15 @@ class IPPO(MultiAgent):
         self._distill_latest_intercept_rate = None
         self._distill_latest_success_rate = None
 
+        self._distill_zero_streak = 0           # info_gain_ema 连续接近 0 的 update 次数（用于 cutoff）
+        self._distill_permanently_off = False    # 蒸馏权重归零后永久锁死，不再上涨
+
         self._optimal_assignment_sorted = None  # [N, M, K_target] from trainer
 
         self._margin_reg_update_count = 0  # margin reg warmup 计数器（按 update 次数）
+
+        self._distill_total_timestep = 0        # 累计训练步数，续训时从 checkpoint 恢复，不随 trainer 重置
+        self._distill_last_trainer_timestep = 0 # 上一次 update 时 trainer 的 timestep，用于计算 delta
 
         # set up automatic mixed precision
         self._device_type = torch.device(device).type
@@ -374,23 +411,25 @@ class IPPO(MultiAgent):
         self._current_next_states = []
 
     def _update_distill_ema(self, avg_raw_kl: float, avg_entropy: float = None):
-        """每个update结束时调用一次。
+        """
+        # EMA 就是 Exponential Moving Average,中文一般叫 指数滑动平均 或 指数加权平均。它是一种对时间序列数据进行平滑处理的方法，能够更稳定地跟踪数据的趋势，减少噪声的影响。
+        每个update结束时调用一次,也就是收集完一次rollout数据后调用一次。
         1.更新 KL 的 EMA(teacher vs student 的分配差距),KL EMA大说明学生和老师的差距大
         2.在 ITAD 模式下更新 分配熵的 EMA,熵ema高说明student 的 assignment_probs 更均匀、更犹豫,低说明student 的分配更尖锐、更确定
         3.用 KL 与熵的"下降速率"计算 信息增益 info_gain,再对它做 EMA,并在 warmup 阶段估计 baseline
 
         Args:
-            avg_raw_kl: 本次 update 中所有 mini-batch 的原始 KL 平均值
-            avg_entropy: 本次 update 的 assignment entropy(可选,ITAD 模式需要)
+            avg_raw_kl: 本次 update 中所有 mini-batch 的 KL 平均值（老师和学生的差距）
+            avg_entropy: 本次 update 的 assignment entropy,越大说明学生的分配越均匀（不确定），越小说明学生的分配越尖锐（确定）。这个值在 ITAD 模式下才有意义。
         """
         if self._distill_weight_init <= 0:
             return
 
         # 记录KL的历史最大值（用于 hybrid 模式的 kl_ratio 归一化，比初始值更稳定）
-        if self._distill_initial_kl is None:
-            self._distill_initial_kl = avg_raw_kl
+        if self._distill_peak_kl is None:
+            self._distill_peak_kl = avg_raw_kl
         else:
-            self._distill_initial_kl = max(self._distill_initial_kl, avg_raw_kl)
+            self._distill_peak_kl = max(self._distill_peak_kl, avg_raw_kl)
 
         # 保存上一次的 kl_ema（用于 ITAD 计算变化率）
         self._distill_kl_ema_prev = self._distill_kl_ema
@@ -406,7 +445,7 @@ class IPPO(MultiAgent):
             )
 
         # ITAD: 更新 entropy EMA 和信息增益
-        if self._distill_anneal_type == "itad" and avg_entropy is not None:
+        if self._distill_anneal_type in ("itad", "itad_v2") and avg_entropy is not None:
             # 1) 拦截率EMA
             if self._distill_latest_intercept_rate is not None:
                 v = self._distill_latest_intercept_rate
@@ -458,8 +497,8 @@ class IPPO(MultiAgent):
                     self._distill_perf_fast = composite_perf
                     self._distill_perf_slow = composite_perf
                 else:
-                    self._distill_perf_fast = fast_m * self._distill_perf_fast + (1 - fast_m) * composite_perf
-                    self._distill_perf_slow = slow_m * self._distill_perf_slow + (1 - slow_m) * composite_perf
+                    self._distill_perf_fast = fast_m * self._distill_perf_fast + (1 - fast_m) * composite_perf      # 短期内性能的变化
+                    self._distill_perf_slow = slow_m * self._distill_perf_slow + (1 - slow_m) * composite_perf      # 长期性能的趋势
 
                 # 6) 只在warmup结束后跟踪历史最高（用慢EMA）
                 if self._distill_info_gain_warmup > self._distill_info_gain_warmup_n:
@@ -469,6 +508,7 @@ class IPPO(MultiAgent):
                         best_decay = self.cfg.get("distill_perf_best_decay", 0.999)
                         self._distill_perf_best = max(self._distill_perf_slow, best_decay * self._distill_perf_best)
 
+            # 7) 更新熵的EMA（student 的分配不确定性）
             self._distill_entropy_ema_prev = self._distill_entropy_ema
             if self._distill_entropy_ema is None:
                 self._distill_entropy_ema = avg_entropy
@@ -482,10 +522,18 @@ class IPPO(MultiAgent):
             if self._distill_kl_ema_prev is not None and self._distill_entropy_ema_prev is not None:
                 eps = 1e-8
                 # KL 变化率：正值 = KL 在下降 = student 在学习
+                # teacher-student KL 的相对下降率
+                    # kl_rate > 0：KL 在下降，student 更像 teacher
+                    # kl_rate = 0：基本没进展
+                    # kl_rate < 0：KL 在升高，student 反而更不像 teacher
                 delta_kl = self._distill_kl_ema_prev - self._distill_kl_ema # delta_kl 为正值：KL 下降（student 更像 teacher）
                 kl_rate = delta_kl / max(self._distill_kl_ema_prev, eps)    # 相对下降率
 
                 # 熵变化率：正值 = 熵在下降 = 决策更确定
+                # student assignment entropy 的相对下降率
+                    # entropy_rate > 0：熵下降，student 更确定
+                    # entropy_rate = 0：确定性没怎么变
+                    # entropy_rate < 0：熵上升，student 更犹豫了
                 delta_h = self._distill_entropy_ema_prev - self._distill_entropy_ema
                 entropy_rate = delta_h / max(self._distill_entropy_ema_prev, eps)
 
@@ -508,6 +556,7 @@ class IPPO(MultiAgent):
                         (1 - self._distill_info_gain_momentum) * info_gain
                     )
 
+                # baseline 是用来回答：当前的 teacher 帮助，到底还算不算“明显”
                 # warmup 后继续用慢速 EMA 跟踪 baseline，防止 baseline 过时
                 self._distill_info_gain_warmup += 1
                 if self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n:
@@ -529,7 +578,7 @@ class IPPO(MultiAgent):
                         baseline_floor
                     )
 
-    def _compute_distill_weight(self, timestep: int) -> float:
+    def _compute_distill_weight(self) -> float:
         """纯函数:根据当前EMA状态计算蒸馏权重,不修改任何状态。
 
         Args:
@@ -555,79 +604,187 @@ class IPPO(MultiAgent):
                     self._distill_info_gain_baseline is None or
                     self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n):
                 return self._distill_weight_init
+            return self._compute_itad_weight()
+        elif self._distill_anneal_type == "itad_v2":
+            # Phase 1: ramp up from weight_min to weight_init
+            warmup_steps = self.cfg.get("distill_v2_warmup_steps", 1000)
+            if self._distill_total_timestep < warmup_steps:
+                progress = self._distill_total_timestep / max(warmup_steps, 1)
+                return self._distill_weight_min + (
+                    self._distill_weight_init - self._distill_weight_min
+                ) * progress
 
-            # --- 退火信号：只用ratio正部分驱动"teacher还有帮助" ---
-            # ratio从1（初期）自然降到0（后期），负值=学生可能在探索更好策略，不惩罚
-            # ratio 是"当前信息增益占典型幅度的比例"：
-            # ratio 大：说明最近还在明显进步（teacher 仍有效）
-            # ratio 小：说明进步速度很小（teacher 边际贡献变小）
-            baseline = max(self._distill_info_gain_baseline, 1e-8)
-            ratio = self._distill_info_gain_ema / baseline
-            ratio_pos = max(ratio, 0.0)
+            # Phase 2: wait until ITAD statistics are ready
+            if (self._distill_info_gain_ema is None or
+                    self._distill_info_gain_baseline is None or
+                    self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n):
+                return self._distill_weight_init
 
-            # 归一化 sigmoid：ratio_pos=0 → 0, ratio_pos=1 → 1, clamp 防止 ratio_pos>1 时超出
-            k = self.cfg.get("distill_itad_sigmoid_k", 6.0)
-            raw_sig = 1.0 / (1.0 + math.exp(-k * (ratio_pos - 0.5)))
-            sig_floor = 1.0 / (1.0 + math.exp(k * 0.5))    # ratio_pos=0 时的值
-            sig_ceil  = 1.0 / (1.0 + math.exp(-k * 0.5))   # ratio_pos=1 时的值
-            smooth_ratio = (raw_sig - sig_floor) / (sig_ceil - sig_floor)
-            smooth_ratio = max(0.0, min(1.0, smooth_ratio))  # clamp [0,1]
+            # Phase 3: hold peak teacher strength until student basically learns teacher
+            if self._distill_kl_ema is None:
+                return self._distill_weight_init
 
-            # hard cutoff：smooth_ratio 很小时直接 snap 到 0
-            cutoff = self.cfg.get("distill_itad_zero_cutoff", 0.01)
-            if smooth_ratio < cutoff:
-                smooth_ratio = 0.0
+            plateau_steps = self.cfg.get("distill_v2_plateau_steps", 10000)
+            if self._distill_total_timestep < (plateau_steps + warmup_steps):
+                return self._distill_weight_init
+            # perf_ready = (
+            #     self._distill_intercept_rate_ema is not None and
+            #     self._distill_intercept_rate_ema >= 0.15
+            # )
 
-            w_anneal = self._distill_weight_init * (
-                self._distill_weight_min + (1.0 - self._distill_weight_min) * smooth_ratio
-            )
+            # if not perf_ready:
+            #     return self._distill_weight_init
 
-            # --- 纠偏：弱、慢、受限、随退火消失 ---
-            # 纠偏只能减缓下降速度，不能逆转下降趋势
-            restore_strength = 0.0
-            if (self._distill_perf_fast is not None and
-                    self._distill_perf_slow is not None and
-                    self._distill_perf_best is not None and
-                    abs(self._distill_perf_best) > 1e-6):
-                fast_dropping = self._distill_perf_fast < self._distill_perf_slow
-                slow_drop = max(0.0, (self._distill_perf_best - self._distill_perf_slow) / abs(self._distill_perf_best))
+            # if self._distill_kl_ema > self._distill_target_kl or not perf_ready:
+            #     return self._distill_weight_init
 
-                if fast_dropping and slow_drop > 0:
-                    restore_k = self.cfg.get("distill_itad_restore_k", 4.0)
-                    restore_threshold = self.cfg.get("distill_itad_restore_threshold", 0.05)
-                    restore_gate = 1.0 / (1.0 + math.exp(-restore_k * (slow_drop - restore_threshold)))
-
-                    # 退火衰减因子：w_anneal 越小纠偏越弱，到 0 时纠偏完全消失
-                    anneal_decay = w_anneal / max(self._distill_weight_init, 1e-8)
-                    # 最大纠偏幅度：w_anneal 的一个小比例
-                    max_restore = self.cfg.get("distill_itad_max_restore_ratio", 0.3) * w_anneal
-                    restore_strength = restore_gate * anneal_decay * max_restore
-
-            # 单调约束：target 不能超过 prev，纠偏只能减缓下降
-            prev = self._cached_distill_weight
-            target_weight = min(w_anneal + restore_strength, prev)
-
-            # Rate limiter：限制单次下降幅度，delta 只能 ≤ 0（权重只降不升）
-            max_delta = self.cfg.get("distill_itad_max_delta", 0.10) * self._distill_weight_init
-            # weight = prev + max(-max_delta, min(0.0, target_weight - prev))
-            weight = prev + max(-max_delta, min(self._distill_weight_min, target_weight - prev))
-
-            return weight
+            # Phase 4: once KL is low enough, hand over to ITAD
+            return self._compute_itad_weight()
         elif self._distill_anneal_type == "hybrid":
-            time_factor = max(0.0, 1.0 - timestep / self._distill_anneal_steps)
-            if self._distill_kl_ema is not None and self._distill_initial_kl is not None:
-                kl_factor = min(1.0, self._distill_kl_ema / max(self._distill_initial_kl, 1e-8))
+            time_factor = max(0.0, 1.0 - self._distill_total_timestep / self._distill_anneal_steps)
+            if self._distill_kl_ema is not None and self._distill_peak_kl is not None:
+                kl_factor = min(1.0, self._distill_kl_ema / max(self._distill_peak_kl, 1e-8))
                 kl_factor = max(self._distill_weight_min, kl_factor)
             else:
                 kl_factor = 1.0
             return self._distill_weight_init * min(time_factor, kl_factor)
         elif self._distill_anneal_type == "linear":
-            progress = min(timestep / self._distill_anneal_steps, 1.0)
+            progress = min(self._distill_total_timestep / self._distill_anneal_steps, 1.0)
             return self._distill_weight_init * max(0.0, 1.0 - progress)
         elif self._distill_anneal_type == "fixed":
             return self._distill_weight_init
         else:
             raise ValueError(f"Unknown distill_anneal_type: {self._distill_anneal_type}")
+
+    def _compute_itad_weight(self) -> float:
+        """itad 核心退火逻辑（不含预热/warmup 判断，由调用方负责）。"""
+        # 永久锁死：权重归零后不再上涨
+        if self._distill_permanently_off:
+            return self._distill_weight_min
+        # ratio = 当前信息增益/基线信息增益
+        # ratio ≈ 1：当前收益跟基线差不多，蒸馏还挺有用
+        # ratio < 1：当前收益比以前低，蒸馏价值在下降
+        # ratio > 1：当前收益比基线还高，蒸馏很有用
+        # ratio < 0：说明信息增益已经反向了，直接截成 0
+        baseline = max(self._distill_info_gain_baseline, 1e-8)
+        ratio = self._distill_info_gain_ema / baseline
+        ratio_pos = max(ratio, 0.0)
+
+        k = self.cfg.get("distill_itad_sigmoid_k", 6.0)         # k 大：曲线更陡，权重对 ratio 的变化更敏感，k 小：曲线更平，权重变化更柔和
+        raw_sig = 1.0 / (1.0 + math.exp(-k * (ratio_pos - 0.5)))
+        sig_floor = 1.0 / (1.0 + math.exp(k * 0.5))
+        sig_ceil  = 1.0 / (1.0 + math.exp(-k * 0.5))
+        smooth_ratio = (raw_sig - sig_floor) / (sig_ceil - sig_floor)
+        smooth_ratio = max(0.0, min(1.0, smooth_ratio))
+        print(f"ITAD ratio: info_gain_ema={self._distill_info_gain_ema:.6f}, baseline={baseline:.6f}, ratio={ratio:.4f}, smooth_ratio={smooth_ratio:.4f}")
+
+        # ------------------------------------------------------------------ #
+        # Cutoff：三个条件同时满足才把 smooth_ratio 归零
+        #   1. ratio 连续 N 次 update 接近 0（持续低信息增益）
+        #   2. 任务性能没有恶化（perf_fast >= perf_slow * (1 - tol)）
+        # ------------------------------------------------------------------ #
+        ratio_cutoff  = self.cfg.get("distill_itad_ratio_cutoff",  0.05)  # ratio 低于此值算"接近 0"
+        streak_n      = self.cfg.get("distill_itad_zero_streak_n", 10)    # 需要连续多少次 update
+        perf_drop_tol = self.cfg.get("distill_itad_perf_drop_tol", 0.05)  # 性能允许下降的容忍比例
+
+        # 条件 1：更新连续计数器
+        if ratio < ratio_cutoff:
+            self._distill_zero_streak += 1
+        else:
+            self._distill_zero_streak = 0
+        # 条件 2：任务性能没有恶化
+        # perf_ok = True
+        # if (self._distill_perf_fast is not None and
+        #         self._distill_perf_slow is not None and
+        #         abs(self._distill_perf_slow) > 1e-6):
+        #     perf_ok = self._distill_perf_fast >= self._distill_perf_slow * (1.0 - perf_drop_tol)
+        # if self._distill_zero_streak >= streak_n and perf_ok:
+        #     return self._distill_weight_init
+        if self._distill_zero_streak >= streak_n:
+            self._distill_permanently_off = True
+            print(f"ITAD: 蒸馏权重永久关闭 (zero_streak={self._distill_zero_streak} >= {streak_n})")
+            return self._distill_weight_min
+
+        # 信息增益高 -> smooth_ratio 大 -> w_anneal 接近初始蒸馏权重
+        # 信息增益低 -> smooth_ratio 小 -> w_anneal 接近最小蒸馏权重
+        w_anneal = self._distill_weight_init * (self._distill_weight_min + (1.0 - self._distill_weight_min) * smooth_ratio)
+        print(f"ITAD anneal: info_gain_ema={self._distill_info_gain_ema:.6f}, baseline={baseline:.6f}, ratio={ratio:.4f}, smooth_ratio={smooth_ratio:.4f}, w_anneal={w_anneal:.6f}")
+        # ---------- KL floor ----------
+        # FIXME：好像这个玩意有点问题
+        # student 越没学会，kl_gate 越大
+        # kl_gap > 0：student 和 teacher 还不够像，蒸馏不能退得太狠
+        # kl_gap < 0：student 已经学得比较像了，KL 保底可以放松
+        # if self._distill_kl_ema is not None:
+        #     kl_margin = self.cfg.get("distill_itad_kl_margin", 0.05)
+        #     kl_tau = self.cfg.get("distill_itad_kl_tau", 0.03)
+        #     kl_gap = self._distill_kl_ema - (self._distill_target_kl + kl_margin)
+        #     kl_gate = 1.0 / (1.0 + math.exp(-kl_gap / max(kl_tau, 1e-6)))
+        #     print(f"ITAD KL gate: kl_ema={self._distill_kl_ema:.6f}, kl_gap={kl_gap:.6f}, kl_gate={kl_gate:.4f}")
+        # else:
+        #     kl_gate = 1.0
+
+        # kl_floor_ratio = self.cfg.get("distill_itad_kl_floor_ratio", 0.25)
+        # w_kl_floor = self._distill_weight_init * (self._distill_weight_min + (kl_floor_ratio - self._distill_weight_min) * kl_gate)
+        # print(f"ITAD KL floor: kl_ema={self._distill_kl_ema:.6f}, kl_gate={kl_gate:.4f}, w_kl_floor={w_kl_floor:.6f}")
+        # w_base = max(w_anneal, w_kl_floor)
+        w_base = w_anneal
+        # ---------- restore ----------
+        # restore_strength = 0.0
+        # perf_ready = (
+        #     self._distill_perf_fast is not None and
+        #     self._distill_perf_slow is not None and
+        #     self._distill_perf_best is not None and
+        #     abs(self._distill_perf_best) > 1e-6
+        # )
+
+        # if perf_ready:
+        #     fast_dropping = self._distill_perf_fast < self._distill_perf_slow                                        # 判断近期性能是否比长期均值更差
+        #     slow_drop = max(0.0 ,(self._distill_perf_best - self._distill_perf_slow) / abs(self._distill_perf_best)) # 当前慢性能相对历史最好性能掉了多少
+
+        #     plateau_eps = self.cfg.get("distill_itad_plateau_eps", 0.1)        # 这也是个经验值，得调。
+        #     plateau = abs(self._distill_perf_fast - self._distill_perf_slow) < plateau_eps
+
+        #     still_not_learned = (
+        #         self._distill_kl_ema is not None and
+        #         self._distill_kl_ema > self._distill_target_kl + self.cfg.get("distill_itad_kl_margin", 0.05)
+        #     )
+
+        #     anneal_decay = math.sqrt(w_base / max(self._distill_weight_init, 1e-8))
+        #     max_restore = self.cfg.get("distill_itad_max_restore_ratio", 0.3) * self._distill_weight_init
+
+        #     # A. regression restore
+        #     if fast_dropping and slow_drop > 0:
+        #         print(f"ITAD restore: fast_dropping={fast_dropping}, slow_drop={slow_drop:.4f}")
+        #         restore_k = self.cfg.get("distill_itad_restore_k", 4.0)
+        #         restore_threshold = self.cfg.get("distill_itad_restore_threshold", 0.05)
+        #         drop_gate = 1.0 / (1.0 + math.exp(-restore_k * (slow_drop - restore_threshold)))
+        #         restore_strength += drop_gate * anneal_decay * max_restore
+        #     # B. plateau restore
+        #     if plateau and still_not_learned:
+        #         print(f"ITAD restore: plateau={plateau}, still_not_learned={still_not_learned}")
+        #         print(f"ITAD restore details: perf_fast={self._distill_perf_fast:.6f}, perf_slow={self._distill_perf_slow:.6f}, perf_best={self._distill_perf_best:.6f}, kl_ema={self._distill_kl_ema:.6f}")
+        #         kl_restore_k = self.cfg.get("distill_itad_kl_restore_k", 8.0)
+        #         kl_tau = self.cfg.get("distill_itad_kl_tau", 0.03)
+        #         kl_gap = self._distill_kl_ema - (
+        #             self._distill_target_kl + self.cfg.get("distill_itad_kl_margin", 0.05)
+        #         )
+        #         plateau_gate = 1.0 / (1.0 + math.exp(-kl_restore_k * kl_gap / max(kl_tau, 1e-6)))
+        #         restore_strength += plateau_gate * anneal_decay * max_restore
+
+        prev = self._cached_distill_weight
+        # target_weight = min(self._distill_weight_init, w_base + restore_strength)
+        target_weight = min(self._distill_weight_init, w_base)
+        # print(f"ITAD final weight: w_base={w_base:.6f}, restore_strength={restore_strength:.6f}, target_weight={target_weight:.6f}, prev_weight={prev:.6f}")
+        max_down = self.cfg.get("distill_itad_max_down_delta", 0.001) * self._distill_weight_init
+        max_up   = self.cfg.get("distill_itad_max_up_delta",   0.002) * self._distill_weight_init
+
+        delta = target_weight - prev
+        delta = max(-max_down, min(max_up, delta))
+        result = min(self._distill_weight_init, max(self._distill_weight_min, prev + delta))
+        # 权重降到 min 后永久锁死
+        if result <= self._distill_weight_min:
+            self._distill_permanently_off = True
+        return result
 
     def _extract_visibility_mask(self, policy, raw_states, target_dim):
         """从 raw_states 提取 visibility_mask [B, target_dim]。
@@ -919,10 +1076,10 @@ class IPPO(MultiAgent):
 
         # compute explained variance
         # adapted from https://github.com/DLR-RM/stable-baselines3
-        v_pred = torch.cat(value_list).reshape(-1)
-        v_true = torch.cat(return_list).reshape(-1)
+        v_pred = torch.cat(value_list).reshape(-1)      # critic 预测的 value
+        v_true = torch.cat(return_list).reshape(-1)     # GAE 算出来的 returns
         var_v = torch.var(v_true, unbiased=False)
-        explained_var = float("nan") if var_v == 0 else (1 - torch.var(v_true - v_pred, unbiased=False) / var_v).item()
+        explained_var = float("nan") if var_v == 0 else (1 - torch.var(v_true - v_pred, unbiased=False) / var_v).item() # critic 对 returns 的解释程度
 
         # merge mini-batches from all agents by concatenating along batch dimension
         # adapted from https://github.com/jackzeng-robotics/skrl
@@ -947,7 +1104,7 @@ class IPPO(MultiAgent):
         cumulative_distill_loss = 0.0
         cumulative_raw_kl = 0.0               # 原始KL散度（未加权）
         distill_count = 0                   # 实际计算了KL的batch数
-        _entropy_accum = None               # Bug1: tensor 累积 entropy，避免每次 .item() 同步
+        _entropy_accum = None
         _entropy_accum_count = 0
         clip_fractions = []
         has_assignment_reg = hasattr(policy, "get_margin_regularization")
@@ -981,7 +1138,6 @@ class IPPO(MultiAgent):
                     ) = batch
 
                 with torch.autocast(device_type=self._device_type, enabled=self._mixed_precision):
-
                     raw_states = sampled_states     #存储未归一化的观测
                     sampled_states = self._state_preprocessor[agent_0](sampled_states, train=not epoch)
 
@@ -1005,11 +1161,9 @@ class IPPO(MultiAgent):
                         entropy_loss = 0
 
                     # compute assignment margin regularization
-                    # 用 margin 正则替代熵正则，独立于蒸馏权重
                     assignment_reg_loss = 0
                     if has_assignment_reg:
                         try:
-                            # 提取 visibility_mask（复用辅助方法）
                             vis_mask = self._extract_visibility_mask(
                                 policy, raw_states,
                                 getattr(policy, 'num_targets', 5)
@@ -1018,6 +1172,22 @@ class IPPO(MultiAgent):
                             # margin 正则：独立于蒸馏权重
                             margin_m = self.cfg.get("assignment_margin", 0.2)
                             margin_w = self.cfg.get("assignment_margin_weight", None)  # None = 用 entropy_reg_weight
+
+                            # if sampled_optimal_assignment is not None and hasattr(policy, 'get_teacher_guided_margin_reg'):
+                            #     # teacher-guided：推老师认为该追的目标在学生分布中领先
+                            #     assignment_reg_loss = policy.get_teacher_guided_margin_reg(
+                            #         teacher_probs=sampled_optimal_assignment,
+                            #         visibility_mask=vis_mask,
+                            #         margin=margin_m,
+                            #         weight=margin_w,
+                            #     )
+                            # else:
+                            #     # fallback：无 teacher 时用原始 top1 vs top2
+                            #     assignment_reg_loss = policy.get_margin_regularization(
+                            #         visibility_mask=vis_mask,
+                            #         margin=margin_m,
+                            #         weight=margin_w,
+                            #     )
                             assignment_reg_loss = policy.get_margin_regularization(
                                 visibility_mask=vis_mask,
                                 margin=margin_m,
@@ -1025,6 +1195,7 @@ class IPPO(MultiAgent):
                             )
 
                             # 独立 warmup schedule：前 N 次 update 不施加 reg，之后线性 ramp up
+                            # FIXME：到什么时候才开始施加正则比较好？一开始学生都不会控制自己。
                             reg_warmup = self.cfg.get("assignment_reg_warmup_updates", 0)
                             if reg_warmup > 0 and self._margin_reg_update_count < reg_warmup:
                                 reg_scale = self._margin_reg_update_count / reg_warmup
@@ -1055,6 +1226,7 @@ class IPPO(MultiAgent):
 
                     # compute distillation loss (Sinkhorn optimal assignment → attention assignment)
                     # 让 student 的分配分布更接近 teacher（在可见目标子集上）
+                    # ---------------- global teacher distillation loss ----------------
                     distill_loss = 0
                     if self._distill_weight_init > 0 and sampled_optimal_assignment is not None:
                         # get current assignment_probs from cached policy output
@@ -1104,8 +1276,8 @@ class IPPO(MultiAgent):
                                 pg_sum = pred_gated.sum(dim=-1, keepdim=True).clamp(min=1e-8)
                                 pred_gated = pred_gated / pg_sum * has_visible
                                 # 逐样本 KL，只对有可见目标的样本求均值
-                                log_pred_g = torch.log(pred_gated + 1e-8)
-                                log_target_g = torch.log(target_gated + 1e-8)
+                                log_pred_g = torch.log(pred_gated + 1e-8)       # 学生可见目标分布
+                                log_target_g = torch.log(target_gated + 1e-8)   # 教师可见目标分布
                                 per_sample_kl = (target_gated * (log_target_g - log_pred_g)).sum(dim=-1)
                                 valid_samples = has_visible.squeeze(-1)
                                 if valid_samples.sum() > 0:
@@ -1122,7 +1294,7 @@ class IPPO(MultiAgent):
                             distill_loss = self._cached_distill_weight * raw_kl_val
 
                             # 累积 entropy 用于 ITAD（复用 visibility_mask，对齐 KL 的可见性门控）
-                            if self._distill_anneal_type == "itad":
+                            if self._distill_anneal_type in ("itad", "itad_v2"):
                                 _cache = getattr(policy, '_assignment_probs_cache', None)
                                 if _cache is not None:
                                     with torch.no_grad():
@@ -1139,9 +1311,67 @@ class IPPO(MultiAgent):
                                         e = e.mean()
                                         _entropy_accum = e if _entropy_accum is None else (_entropy_accum + e)
                                         _entropy_accum_count += 1
+                    # ---------------- global teacher distillation loss ----------------
 
+                    # ---------------- local teacher distillation loss ----------------
+                    # distill_loss = 0
+                    # if self._distill_weight_init > 0 and sampled_optimal_assignment is not None:
+                    #     assignment_probs = getattr(policy, '_assignment_probs_cache', None)
+                    #     if assignment_probs is not None:
+                    #         target_l = sampled_optimal_assignment  # [B, K_target]，无效槽位已为 0
+                    #         pred_l = assignment_probs              # [B, E]
+                    
+                    #         # 维度对齐
+                    #         K_l, E_l = target_l.shape[-1], pred_l.shape[-1]
+                    #         if K_l != E_l:
+                    #             if K_l < E_l:
+                    #                 pad = torch.zeros(target_l.shape[0], E_l - K_l,
+                    #                                   device=target_l.device, dtype=target_l.dtype)
+                    #                 target_l = torch.cat([target_l, pad], dim=-1)
+                    #             else:
+                    #                 target_l = target_l[:, :E_l]
+                    
+                    #         # 有效槽位 mask（局部 teacher 无效槽位已是硬零，直接用阈值判断）
+                    #         valid_mask_l = (target_l > 1e-8)                          # [B, E]
+                    #         has_valid_l = valid_mask_l.any(dim=-1, keepdim=True).to(target_l.dtype)  # [B, 1]
+                    
+                    #         # 归一化 teacher（防御性，局部 teacher 已归一化但以防万一）
+                    #         t_sum_l = target_l.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    #         target_l = target_l / t_sum_l * has_valid_l
+                    
+                    #         # 对齐 student：只保留 teacher 有概率的槽位后归一化
+                    #         pred_l_masked = pred_l * valid_mask_l.to(pred_l.dtype)
+                    #         p_sum_l = pred_l_masked.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    #         pred_l_masked = pred_l_masked / p_sum_l * has_valid_l
+                    
+                    #         # 逐样本 KL，只对有有效目标的样本求均值
+                    #         log_pred_l = torch.log(pred_l_masked + 1e-8)
+                    #         log_target_l = torch.log(target_l + 1e-8)
+                    #         per_sample_kl_l = (target_l * (log_target_l - log_pred_l)).sum(dim=-1)
+                    #         valid_samples_l = has_valid_l.squeeze(-1)
+                    #         if valid_samples_l.sum() > 0:
+                    #             raw_kl_val = (per_sample_kl_l * valid_samples_l).sum() / valid_samples_l.sum()
+                    #         else:
+                    #             raw_kl_val = torch.tensor(0.0, device=pred_l.device)
+                    
+                    #         distill_loss = self._cached_distill_weight * raw_kl_val
+                    
+                    #         # entropy 累积（ITAD 用，以有效槽位数归一化）
+                    #         if self._distill_anneal_type in ("itad", "itad_v2"):
+                    #             _cache = getattr(policy, '_assignment_probs_cache', None)
+                    #             if _cache is not None:
+                    #                 with torch.no_grad():
+                    #                     p = _cache.detach()
+                    #                     p = p * valid_mask_l.to(p.dtype)
+                    #                     p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                    #                     k_vis = valid_mask_l.to(p.dtype).sum(dim=-1).clamp(min=1.0)
+                    #                     norm = torch.log(k_vis).clamp(min=1e-6)
+                    #                     e = -(p * torch.log(p.clamp(min=1e-8))).sum(dim=-1) / norm
+                    #                     e = e.mean()
+                    #                     _entropy_accum = e if _entropy_accum is None else (_entropy_accum + e)
+                    #                     _entropy_accum_count += 1
+                    # ---------------- local teacher distillation loss ----------------
                 # optimization step
-                # FIXME：这新加的两个loss项是否会起到共同推进的作用，还是相互干扰的作用？
                 self.optimizers[agent_0].zero_grad()
                 total_loss = policy_loss + entropy_loss + value_loss + assignment_reg_loss + distill_loss
                 self.scaler.scale(total_loss).backward()
@@ -1207,21 +1437,23 @@ class IPPO(MultiAgent):
             )
         if has_assignment_reg:
             self.track_data(
-                f"Distillation / Assignment reg loss",      # reg_loss 持续偏高：分配一直很犹豫。reg_loss 很快变很低：分配过早变尖
+                f"Distillation / Assignment reg loss",
                 cumulative_assignment_reg_loss / (self._learning_epochs[agent_0] * self._mini_batches[agent_0]),
-            )
+            ) # 越小说明top1和top2的分配概率差距越大（更"果断"），但过大会导致过拟合 teacher 的分配（不够灵活）。这个正则项的引入是为了让学生在学习 teacher 的分配时更果断一些，避免过于平均地分配注意力，从而更好地模仿 teacher 的行为。
         if self._distill_weight_init > 0:
             avg_raw_kl = cumulative_raw_kl / max(distill_count, 1)
             avg_weighted_loss = cumulative_distill_loss / max(distill_count, 1)
 
             avg_entropy = None
-            if self._distill_anneal_type == "itad" and _entropy_accum is not None and _entropy_accum_count > 0:
-                avg_entropy = (_entropy_accum / _entropy_accum_count).item()  # 只在这里同步一次
-
+            if self._distill_anneal_type in ("itad", "itad_v2") and _entropy_accum is not None and _entropy_accum_count > 0:
+                avg_entropy = (_entropy_accum / _entropy_accum_count).item()
             if distill_count > 0:
                 self._update_distill_ema(avg_raw_kl, avg_entropy)
 
-            self._cached_distill_weight = self._compute_distill_weight(timestep)
+            delta = timestep - self._distill_last_trainer_timestep
+            self._distill_total_timestep += max(delta, 0)
+            self._distill_last_trainer_timestep = timestep
+            self._cached_distill_weight = self._compute_distill_weight()
 
             self.track_data(f"Distillation / Distillation loss (raw KL)", avg_raw_kl) # teacher 和 student 分配分布的 真实差距（纯 KL），不乘权重。student 当前跟 teacher 像不像（越小越像）。
             self.track_data(f"Distillation / Distillation loss (weighted)", avg_weighted_loss) # 真正加进你 total_loss 里参与反向传播的蒸馏损失项。蒸馏这一项在总 loss 里到底贡献了多大（梯度强不强）
@@ -1254,7 +1486,7 @@ class IPPO(MultiAgent):
                 # 越大表示“最近一段时间平均拦截效果越好”
             # Distillation / Success Rate EMA
                 # 越大表示“最近一段时间平均任务成功效果越好”
-            if self._distill_anneal_type == "itad":
+            if self._distill_anneal_type in ("itad", "itad_v2"):
                 if self._distill_info_gain_ema is not None:
                     self.track_data(f"Distillation / Info Gain EMA", self._distill_info_gain_ema)
                 if self._distill_entropy_ema is not None:

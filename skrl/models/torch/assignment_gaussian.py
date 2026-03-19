@@ -27,7 +27,7 @@ class TargetAssignmentModule(nn.Module):
 
     def __init__(self, embed_dim: Union[int, List[int]] = 64, num_targets: int = 5,
                  num_heads: int = 4,
-                 use_quaternion: bool = True):
+                 use_quaternion: bool = False):
         """
         Args:
             embed_dim: Embedding dimension(s) for query, key, value vectors
@@ -48,13 +48,13 @@ class TargetAssignmentModule(nn.Module):
             self.embed_dim = embed_dim
             query_input_dim = 11 if use_quaternion else 7
             query_layers = [query_input_dim, 64, embed_dim]
-            key_layers = [7, 64, embed_dim]
+            key_layers = [12, 64, embed_dim]
             value_layers = [7, 64, embed_dim]
         else:
             self.embed_dim = embed_dim[-1]
             query_input_dim = 11 if use_quaternion else 7
             query_layers = [query_input_dim] + list(embed_dim)
-            key_layers = [7] + list(embed_dim)
+            key_layers = [12] + list(embed_dim)
             value_layers = [7] + list(embed_dim)
 
         if self.embed_dim % num_heads != 0:
@@ -90,15 +90,20 @@ class TargetAssignmentModule(nn.Module):
     def forward(
         self,
         self_state: torch.Tensor,
-        target_features: torch.Tensor,
+        target_features_k: torch.Tensor,
+        target_features_v: Optional[torch.Tensor] = None,
         target_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute soft target assignment with standard multi-head attention.
 
+        K uses cooperative features (who to attend to),
+        V uses ego-centric features (what information to aggregate).
+
         Args:
             self_state: [B, 7 or 11] - Agent's own state (pos + vel + yaw) or (+ quat)
-            target_features: [B, E, 7] - Target relative features (rel_pos + rel_vel + dist)
+            target_features_k: [B, E, 12] - Target features for K (rel_pos + rel_vel + dist + team_min_dist + closer_fraction + team_max_closing + team_approaching_frac + team_min_eta)
+            target_features_v: [B, E, 7]  - Target features for V (rel_pos + rel_vel + dist). If None, uses target_features_k[:, :, :7]
             target_valid: [B, E] - Optional mask indicating valid targets (1 = valid)
 
         Returns:
@@ -106,17 +111,22 @@ class TargetAssignmentModule(nn.Module):
             assignment_probs: [B, E] - Soft assignment probabilities (sum to 1)
             assignment_features: [B, 5] - assignment_entropy(1) + min_dist(1) + weighted_target_pos(3)
         """
+        if target_features_v is None:
+            target_features_v = target_features_k[:, :, :7]
+
         # Apply validity mask to target features (zero-out invalid targets)
         if target_valid is not None:
             if target_valid.dim() == 3:
                 target_valid = target_valid.squeeze(-1)
-            target_valid = target_valid.to(device=target_features.device, dtype=torch.bool)
-            target_features = target_features * target_valid.to(target_features.dtype).unsqueeze(-1)
+            target_valid = target_valid.to(device=target_features_k.device, dtype=torch.bool)
+            valid_f = target_valid.to(target_features_k.dtype).unsqueeze(-1)
+            target_features_k = target_features_k * valid_f
+            target_features_v = target_features_v * valid_f
 
         # Encode Q, K, V
-        q = self.agent_query_net(self_state).unsqueeze(1)  # [B, 1, embed_dim]
-        k = self.target_key_net(target_features)           # [B, E, embed_dim]
-        v = self.target_value_net(target_features)         # [B, E, embed_dim]
+        q = self.agent_query_net(self_state).unsqueeze(1)    # [B, 1, embed_dim]
+        k = self.target_key_net(target_features_k)           # [B, E, embed_dim]
+        v = self.target_value_net(target_features_v)         # [B, E, embed_dim]
 
         # key_padding_mask: True = 忽略该位置 (PyTorch MHA 约定)
         # 当某行所有目标都无效时，key_padding_mask 全为 True，
@@ -152,13 +162,13 @@ class TargetAssignmentModule(nn.Module):
 
         # 分配熵：衡量当前分配的确定性（低熵=果断，高熵=犹豫）[B, 1]
         assignment_entropy = -(assignment_probs * torch.log(assignment_probs.clamp(min=1e-8))).sum(dim=-1, keepdim=True)
-        # 最近有效目标距离：target_features[:, :, 6] 是距离维 [B, 1]
+        # 最近有效目标距离：target_features_v[:, :, 6] 是距离维 [B, 1]
         if target_valid is not None:
-            dist_masked = target_features[:, :, 6].masked_fill(~target_valid, float('inf'))
+            dist_masked = target_features_v[:, :, 6].masked_fill(~target_valid, float('inf'))
             min_dist = dist_masked.min(dim=-1, keepdim=True)[0].clamp(max=1e4)  # [B, 1]
         else:
-            min_dist = target_features[:, :, 6].min(dim=-1, keepdim=True)[0]   # [B, 1]
-        weighted_target_pos = (assignment_probs.unsqueeze(-1) * target_features[:, :, :3]).sum(dim=1)  # [B, 3]
+            min_dist = target_features_v[:, :, 6].min(dim=-1, keepdim=True)[0]   # [B, 1]
+        weighted_target_pos = (assignment_probs.unsqueeze(-1) * target_features_v[:, :, :3]).sum(dim=1)  # [B, 3]
         assignment_features = torch.cat([assignment_entropy, min_dist, weighted_target_pos], dim=-1)  # [B, 5]
 
         # When all targets are invalid, zero out assignment_features to avoid misleading control_net
@@ -199,7 +209,7 @@ class AssignmentGaussianModel(GaussianMixin, Model):
         obs_k_friend_targetpos: int = 5,
         entropy_reg_weight: float = 0.01,
         num_heads: int = 4,
-        use_quaternion: bool = True,
+        use_quaternion: bool = False,
         # Control MLP parameters
         mlp_layers: list = None,
     ):
@@ -481,20 +491,80 @@ class AssignmentGaussianModel(GaussianMixin, Model):
             raw_states=raw_states
         )
 
-        # 用未归一化的原始相对位置算距离（raw_states 未经 RunningStandardScaler）
-        # 归一化后的 target_rel_pos 各维度 std 不同，norm 无法反映真实欧氏距离
+        # 真实欧氏距离（用于 V 特征，raw_states 未经 RunningStandardScaler）
         target_dist = torch.norm(raw_target_rel_pos, dim=-1, keepdim=True)  # [B, E, 1]
 
-        # Concatenate target features: [rel_pos, rel_vel, dist]
-        target_features = torch.cat([
+        # 归一化空间距离（与 teammate_target_pos 同一空间，用于协同比较）
+        target_dist_norm = torch.norm(target_rel_pos, dim=-1, keepdim=True)  # [B, E, 1]
+
+        # V 特征：自身视角，7 维 [rel_pos, rel_vel, dist]
+        target_features_v = torch.cat([
             target_rel_pos,  # [B, E, 3]
             target_rel_vel,  # [B, E, 3]
-            target_dist      # [B, E, 1]
+            target_dist,     # [B, E, 1]
         ], dim=-1)  # [B, E, 7]
 
-        # Assignment module: compute soft assignment with standard multi-head attention
+        # K 特征：加入协同信息，12 维
+        # teammate_target_pos [B, Kf, E, 3]（归一化空间，与 target_dist_norm 同一空间）
+        # 注意：env 端会将冻结队友、无效敌机、padding 槽位的 teammate_target_pos 置零，
+        # 导致 teammate_target_dist=0，必须用 mask 排除这些无效槽位，否则会污染聚合统计。
+        teammate_target_dist = torch.norm(teammate_target_pos, dim=-1)                    # [B, Kf, E]
+        teammate_valid = (teammate_target_dist > 1e-6)                                    # [B, Kf, E] bool
+        valid_count = teammate_valid.float().sum(dim=1).unsqueeze(-1).clamp(min=1.0)      # [B, E, 1] 有效队友数
+
+        # team_min_dist：无效槽位填充大值后再 min，避免被零值打成 0
+        dist_for_min = teammate_target_dist.masked_fill(~teammate_valid, 1e6)             # [B, Kf, E]
+        team_min_dist = dist_for_min.min(dim=1)[0].unsqueeze(-1).clamp(max=50.0)          # [B, E, 1]
+
+        self_dist_norm_exp = target_dist_norm.squeeze(-1).unsqueeze(1)                    # [B, 1, E]
+        # closer_fraction：只统计有效队友中比自己更近的比例
+        closer_mask = (teammate_target_dist < self_dist_norm_exp) & teammate_valid         # [B, Kf, E]
+        closer_fraction = closer_mask.float().sum(dim=1).unsqueeze(-1) / valid_count       # [B, E, 1]
+
+        # === 队友-目标接近速度特征 ===
+        # 队友相对目标的速度 = (teammate_vel - ego_vel) - (target_vel - ego_vel) = teammate_vel - target_vel
+        teammate_to_target_vel = teammate_rel_vel.unsqueeze(2) - target_rel_vel.unsqueeze(1)  # [B, Kf, E, 3]
+
+        # 从队友指向目标的单位方向向量（无效槽位 dist=0 → direction=0 → closing_rate=0）
+        direction = teammate_target_pos / (teammate_target_dist.unsqueeze(-1) + 1e-8)  # [B, Kf, E, 3]
+
+        # 接近速率：正值=队友正在接近目标，负值=远离
+        closing_rate = (teammate_to_target_vel * direction).sum(dim=-1)  # [B, Kf, E]
+
+        # 聚合统计（排除无效槽位）
+        closing_for_max = closing_rate.masked_fill(~teammate_valid, -1e6)                              # [B, Kf, E]
+        team_max_closing = closing_for_max.max(dim=1)[0].unsqueeze(-1).clamp(min=-50.0, max=50.0)      # [B, E, 1]
+        approaching_and_valid = (closing_rate > 0) & teammate_valid                                    # [B, Kf, E]
+        team_approaching_frac = approaching_and_valid.float().sum(dim=1).unsqueeze(-1) / valid_count   # [B, E, 1]
+
+        # === 队友到达目标的预计时间 (ETA) ===
+        # ETA = distance / closing_speed，仅对正在接近的有效队友有意义
+        # 无效槽位和远离/静止的队友 ETA 设为极大值
+        ETA_MAX = 200.0
+        not_approaching = (closing_rate <= 1e-4) | (~teammate_valid)                                   # [B, Kf, E] bool
+        closing_speed_safe = closing_rate.clamp(min=1e-4)                                              # [B, Kf, E] 避免除零
+        eta = (teammate_target_dist / closing_speed_safe).clamp(max=ETA_MAX)                           # [B, Kf, E]
+        eta = eta.masked_fill(not_approaching, ETA_MAX)                                                # 无效/远离/静止 → ETA_MAX
+
+        team_min_eta = eta.min(dim=1)[0].unsqueeze(-1)                                                 # [B, E, 1]
+
+        target_features_k_base = torch.cat([
+            target_rel_pos,
+            target_rel_vel,
+            target_dist_norm,
+        ], dim=-1)
+        target_features_k = torch.cat([
+            target_features_k_base,       # 7: rel_pos(3) + rel_vel(3) + dist_norm(1)
+            team_min_dist,                # 1
+            closer_fraction,              # 1
+            team_max_closing,             # 1
+            team_approaching_frac,        # 1
+            team_min_eta,                 # 1
+        ], dim=-1)  # [B, E, 12]
+
+        # Assignment module: K uses cooperative features, V uses ego-centric features
         context, assignment_probs, assignment_feats = self.assignment_module(
-            self_state, target_features, target_valid=target_valid
+            self_state, target_features_k, target_features_v, target_valid=target_valid
         )
 
         # Cache assignment probs
@@ -610,6 +680,71 @@ class AssignmentGaussianModel(GaussianMixin, Model):
         p_top1 = sorted_probs[:, 0]  # [B]
         p_top2 = sorted_probs[:, 1]  # [B]
         gap = p_top1 - p_top2        # [B]
+
+        # ReLU(margin - gap)：gap 不够大时产生惩罚
+        loss_per_sample = F.relu(margin - gap)  # [B]
+
+        # 只对有效样本求均值
+        loss = (loss_per_sample * valid.float()).sum() / valid.float().sum().clamp(min=1.0)
+
+        return weight * loss
+
+    def get_teacher_guided_margin_reg(self, teacher_probs, visibility_mask=None,
+                                      margin=0.2, weight=None) -> torch.Tensor:
+        """Teacher-guided margin 正则：老师认为该追的目标，应该在学生分布中领先其余目标。
+
+        与 get_margin_regularization 的区别：
+        - 原版推学生自己的 top1 领先 top2，如果 top1 选错了会越推越错
+        - 本版用老师推荐的目标，在学生分布中必须至少比其他任何目标高出 margin；否则就按差多少罚多少
+
+        L = weight * ReLU(margin - (p_student[teacher_top1] - max(p_student[others])))
+
+        Args:
+            teacher_probs: [B, E] teacher 的分配概率（Sinkhorn 输出）
+            visibility_mask: [B, E] bool, True = 可见目标
+            margin: 期望的最小领先差距 (default 0.2)
+            weight: 正则权重, None 时用 self.entropy_reg_weight
+
+        Returns:
+            reg_loss: Scalar regularization loss
+        """
+        if self._assignment_probs_cache is None:
+            return torch.tensor(0.0, device=self.device)
+
+        probs = self._assignment_probs_cache  # [B, E]
+        teacher = teacher_probs.detach()       # [B, E] 不回传梯度到 teacher
+        if weight is None:
+            weight = self.entropy_reg_weight
+
+        if visibility_mask is not None:
+            vis = visibility_mask.to(probs.dtype)
+            # 不可见目标概率置零，然后重新归一化
+            probs = probs * vis
+            probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # teacher 也做同样的 mask
+            teacher = teacher * vis
+            teacher = teacher / teacher.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+            # 可见目标数 < 2 的样本跳过
+            k_vis = vis.sum(dim=-1)  # [B]
+            valid = (k_vis >= 2.0)   # [B] bool
+        else:
+            valid = torch.ones(probs.shape[0], dtype=torch.bool, device=probs.device)
+
+        if not valid.any():
+            return torch.tensor(0.0, device=probs.device)
+
+        # teacher argmax：老师认为该追的目标
+        teacher_top1_idx = teacher.argmax(dim=-1)  # [B]
+
+        # 学生在老师推荐目标上的概率
+        p_teacher_target = probs.gather(1, teacher_top1_idx.unsqueeze(-1)).squeeze(-1)  # [B]
+
+        # 学生在其余目标中的最大概率（排除老师推荐的那个）
+        mask_teacher = torch.zeros_like(probs).scatter_(1, teacher_top1_idx.unsqueeze(-1), 1.0)
+        probs_others = probs * (1.0 - mask_teacher)
+        p_best_other = probs_others.max(dim=-1)[0]  # [B]
+
+        gap = p_teacher_target - p_best_other  # [B]
 
         # ReLU(margin - gap)：gap 不够大时产生惩罚
         loss_per_sample = F.relu(margin - gap)  # [B]
