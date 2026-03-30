@@ -297,6 +297,10 @@ class AssignmentGaussianModel(GaussianMixin, Model):
                 requires_grad=True
             )
 
+        # LayerNorm for context and assignment_feats before concatenation
+        self.context_norm = nn.LayerNorm(final_embed_dim)
+        self.assignment_feats_norm = nn.LayerNorm(5)
+
         # Cache for assignment probabilities (for entropy regularization)
         self._assignment_probs_cache = None
 
@@ -571,7 +575,7 @@ class AssignmentGaussianModel(GaussianMixin, Model):
         self._assignment_probs_cache = assignment_probs
 
         # Augment observations: [original_obs, context, assignment_feats]
-        aug_obs = torch.cat([states, context, assignment_feats], dim=-1)
+        aug_obs = torch.cat([states, self.context_norm(context), self.assignment_feats_norm(assignment_feats)], dim=-1)
 
         # Generate mean actions through control MLP
         mean_actions = self.control_net(aug_obs)
