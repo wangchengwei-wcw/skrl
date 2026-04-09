@@ -96,6 +96,11 @@ class IPPO(MultiAgent):
             "_distill_total_timestep",
             "_distill_zero_streak",
             "_distill_permanently_off",
+            "_distill_avg_visible_gate",
+            "_distill_avg_top1_agreement",
+            "_release_triggered",
+            "_release_update_count",
+            "_release_patience_counter",
         ]
 
         def __init__(self, agent):
@@ -248,6 +253,7 @@ class IPPO(MultiAgent):
         # KL-adaptive annealing parameters
         self._distill_target_kl = self.cfg.get("distill_target_kl", 0.1)                # KL-adaptive退火的目标KL散度，低于此值开始退火。学生要"学到多像老师"才开始放手？
         self._distill_kl_ema_momentum = self.cfg.get("distill_kl_ema_momentum", 0.99)   # KL指数移动平均的动量（平滑）。用多平滑的KL来判断"学到位了"？
+        self._distill_entropy_ema_momentum = self.cfg.get("distill_entropy_ema_momentum", 0.99)  # Entropy指数移动平均的动量（平滑）。用多平滑的Entropy来判断"学到位了"？
         self._distill_kl_ema = None                                                     # 指数移动平均的KL（每个update只更新一次）
         self._distill_peak_kl = None                                                 # 最高KL（用于kl_ratio）
         self._cached_distill_weight = self._distill_weight_init                         # 缓存的权重，mini-batch中使用
@@ -289,8 +295,29 @@ class IPPO(MultiAgent):
         self._distill_zero_streak = 0           # info_gain_ema 连续接近 0 的 update 次数（用于 cutoff）
         self._distill_permanently_off = False    # 蒸馏权重归零后永久锁死，不再上涨
 
-        self._optimal_assignment_sorted = None  # [N, M, K_target] from trainer
+        # ITAD v3: teacher confidence × student incompetence
+        self._distill_avg_visible_gate = None    # 当前 update 的 visible_gate 均值（teacher 信号可执行性）
+        self._distill_avg_top1_agreement = None  # 当前 update 的 top1_agreement 均值（student 学习缺口）
 
+        self._optimal_assignment_sorted = None  # [N, M, K_target] from trainer
+        self._global_assignment_sorted = None   # [N, M, K_target] global Sinkhorn teacher
+        self._local_assignment_sorted = None    # [N, M, K_target] local heuristic teacher
+
+        # ---- dual-teacher distillation parameters ----
+        self._dual_teacher_enable = self.cfg.get("dual_teacher_enable", False)
+        self._distill_alpha_global = self.cfg.get("distill_alpha_global", 0.6)       # global teacher weight in dual loss
+        self._distill_lambda_consistency = self.cfg.get("distill_lambda_consistency", 0.5)  # student-consensus KL weight
+        self._distill_eta_consensus = self.cfg.get("distill_eta_consensus", 0.6)     # global weight in consensus teacher
+
+        # ---- release / anneal schedule (single-direction) ----
+        self._release_triggered = False          # 是否已触发 release
+        self._release_update_count = 0           # 触发后已退火的 update 次数
+        self._release_patience_counter = 0       # 连续满足 trigger 条件的 update 次数
+        self._release_patience_updates = self.cfg.get("distill_release_patience_updates", 20)
+        self._release_success_threshold = self.cfg.get("distill_release_success_threshold", 0.85)
+        self._release_interception_threshold = self.cfg.get("distill_release_interception_threshold", 0.85)
+        self._release_anneal_updates = self.cfg.get("distill_release_anneal_updates", 200)
+        self._release_mode = self.cfg.get("distill_release_mode", "success")
         self._margin_reg_update_count = 0  # margin reg warmup 计数器（按 update 次数）
 
         self._distill_total_timestep = 0        # 累计训练步数，续训时从 checkpoint 恢复，不随 trainer 重置
@@ -388,8 +415,13 @@ class IPPO(MultiAgent):
                     if hasattr(self.policies[uid], 'num_targets'):
                         num_targets = self.policies[uid].num_targets
                     self._distill_num_targets = num_targets
-                    self.memories[uid].create_tensor(name="optimal_assignment", size=num_targets, dtype=torch.float32)
-                    self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages", "optimal_assignment"]
+                    if self._dual_teacher_enable:
+                        self.memories[uid].create_tensor(name="global_assignment", size=num_targets, dtype=torch.float32)
+                        self.memories[uid].create_tensor(name="local_assignment", size=num_targets, dtype=torch.float32)
+                        self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages", "global_assignment", "local_assignment"]
+                    else:
+                        self.memories[uid].create_tensor(name="optimal_assignment", size=num_targets, dtype=torch.float32)
+                        self._tensors_names = ["states", "actions", "log_prob", "values", "returns", "advantages", "optimal_assignment"]
 
         # Validate distillation configuration
         if self._distill_weight_init > 0:
@@ -411,7 +443,8 @@ class IPPO(MultiAgent):
         self._current_log_prob = []
         self._current_next_states = []
 
-    def _update_distill_ema(self, avg_raw_kl: float, avg_entropy: float = None):
+    def _update_distill_ema(self, avg_raw_kl: float, avg_entropy: float = None,
+                            avg_visible_gate: float = None, avg_top1_agreement: float = None):
         """
         # EMA 就是 Exponential Moving Average,中文一般叫 指数滑动平均 或 指数加权平均。它是一种对时间序列数据进行平滑处理的方法，能够更稳定地跟踪数据的趋势，减少噪声的影响。
         每个update结束时调用一次,也就是收集完一次rollout数据后调用一次。
@@ -425,6 +458,12 @@ class IPPO(MultiAgent):
         """
         if self._distill_weight_init <= 0:
             return
+
+        # 存储 update 级别的 visible_gate 和 top1_agreement（用于 ITAD v3 权重计算）
+        if avg_visible_gate is not None:
+            self._distill_avg_visible_gate = avg_visible_gate
+        if avg_top1_agreement is not None:
+            self._distill_avg_top1_agreement = avg_top1_agreement
 
         # 记录KL的历史最大值（用于 hybrid 模式的 kl_ratio 归一化，比初始值更稳定）
         if self._distill_peak_kl is None:
@@ -455,7 +494,7 @@ class IPPO(MultiAgent):
                 else:
                     self._distill_intercept_rate_ema = 0.95 * self._distill_intercept_rate_ema + 0.05 * v
 
-            # 2) 成功率EMA
+            # 2) 成功率EMA（ITAD 路径）
             if self._distill_latest_success_rate is not None:
                 v = self._distill_latest_success_rate
                 if self._distill_success_rate_ema is None:
@@ -463,6 +502,16 @@ class IPPO(MultiAgent):
                 else:
                     self._distill_success_rate_ema = 0.95 * self._distill_success_rate_ema + 0.05 * v
 
+        # dual-teacher release 路径：success_rate_ema 需要在所有 anneal_type 下更新
+        if self._dual_teacher_enable and self._distill_latest_success_rate is not None:
+            v = self._distill_latest_success_rate
+            if self._distill_success_rate_ema is None:
+                self._distill_success_rate_ema = v
+            else:
+                self._distill_success_rate_ema = 0.95 * self._distill_success_rate_ema + 0.05 * v
+
+        # ITAD: 奖励EMA 和复合性能信号（仅 itad/itad_v2 路径）
+        if self._distill_anneal_type in ("itad", "itad_v2") and avg_entropy is not None:
             # 3) 奖励EMA（归一化到[0,1]）
             if len(self._track_rewards) > 0:
                 raw_reward = float(np.mean(self._track_rewards))
@@ -515,8 +564,8 @@ class IPPO(MultiAgent):
                 self._distill_entropy_ema = avg_entropy
             else:
                 self._distill_entropy_ema = (
-                    self._distill_info_gain_momentum * self._distill_entropy_ema +
-                    (1 - self._distill_info_gain_momentum) * avg_entropy
+                    self._distill_entropy_ema_momentum * self._distill_entropy_ema +
+                    (1 - self._distill_entropy_ema_momentum) * avg_entropy
                 )
 
             # 计算信息增益
@@ -560,24 +609,26 @@ class IPPO(MultiAgent):
                 # baseline 是用来回答：当前的 teacher 帮助，到底还算不算“明显”
                 # warmup 后继续用慢速 EMA 跟踪 baseline，防止 baseline 过时
                 self._distill_info_gain_warmup += 1
-                if self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n:
+                success_ema_threshold = self.cfg.get("distill_info_gain_success_ema_threshold", 0.0)
+                success_ema_ok = (
+                    self._distill_success_rate_ema is not None and
+                    self._distill_success_rate_ema >= success_ema_threshold
+                ) if success_ema_threshold > 0.0 else True
+                # warmup 结束条件：次数满 AND success_ema 达标，两者同时满足才固定 baseline
+                # 任意一个不满足就继续收集
+                warmup_not_done = (
+                    self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n or
+                    not success_ema_ok
+                )
+                if warmup_not_done:
                     if self._distill_info_gain_baseline is None:
                         self._distill_info_gain_baseline = abs(info_gain)
                     else:
-                        # 用前 N 次的平均绝对值作为 baseline
+                        # 用累计平均绝对值作为 baseline，warmup 结束后固定不再更新
                         n = self._distill_info_gain_warmup
                         self._distill_info_gain_baseline = (
                             self._distill_info_gain_baseline * (n - 1) + abs(info_gain)
                         ) / n
-                else:
-                    # warmup 后：慢速 EMA 跟踪 abs(info_gain) 瞬时值（非EMA）
-                    baseline_momentum = self.cfg.get("distill_baseline_momentum", 0.995)
-                    baseline_floor = self.cfg.get("distill_baseline_floor", 1e-4)
-                    self._distill_info_gain_baseline = max(
-                        baseline_momentum * self._distill_info_gain_baseline +
-                        (1 - baseline_momentum) * abs(info_gain),
-                        baseline_floor
-                    )
 
     def _compute_distill_weight(self) -> float:
         """纯函数:根据当前EMA状态计算蒸馏权重,不修改任何状态。
@@ -601,9 +652,16 @@ class IPPO(MultiAgent):
                 progress = max(0.0, min(1.0, progress))
                 return self._distill_weight_init * max(self._distill_weight_min, 1.0 - progress)
         elif self._distill_anneal_type == "itad":
-            if (self._distill_info_gain_ema is None or
-                    self._distill_info_gain_baseline is None or
-                    self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n):
+            success_ema_threshold = self.cfg.get("distill_info_gain_success_ema_threshold", 0.0)
+            success_ema_not_ready = (
+                success_ema_threshold > 0.0 and (
+                    self._distill_success_rate_ema is None or
+                    self._distill_success_rate_ema < success_ema_threshold
+                )
+            )
+            if (self._distill_avg_visible_gate is None or
+                    self._distill_avg_top1_agreement is None or
+                    success_ema_not_ready):
                 return self._distill_weight_init
             return self._compute_itad_weight()
         elif self._distill_anneal_type == "itad_v2":
@@ -616,12 +674,17 @@ class IPPO(MultiAgent):
                 ) * progress
 
             # Phase 2: wait until ITAD statistics are ready
-            if (self._distill_info_gain_ema is None or
-                    self._distill_info_gain_baseline is None or
-                    self._distill_info_gain_warmup <= self._distill_info_gain_warmup_n):
+            success_ema_threshold = self.cfg.get("distill_info_gain_success_ema_threshold", 0.0)
+            success_ema_not_ready = (
+                success_ema_threshold > 0.0 and (
+                    self._distill_success_rate_ema is None or
+                    self._distill_success_rate_ema < success_ema_threshold
+                )
+            )
+            if (self._distill_avg_visible_gate is None or
+                    self._distill_avg_top1_agreement is None or
+                    success_ema_not_ready):
                 return self._distill_weight_init
-
-            # Phase 3: hold peak teacher strength until student basically learns teacher
             if self._distill_kl_ema is None:
                 return self._distill_weight_init
 
@@ -659,117 +722,36 @@ class IPPO(MultiAgent):
 
     def _compute_itad_weight(self) -> float:
         """itad 核心退火逻辑（不含预热/warmup 判断，由调用方负责）。"""
-        # 永久锁死：权重归零后不再上涨
+        # 永久锁死：agreement 达到阈值后不再上涨
         if self._distill_permanently_off:
             return self._distill_weight_min
-        # ratio = 当前信息增益/基线信息增益
-        # ratio ≈ 1：当前收益跟基线差不多，蒸馏还挺有用
-        # ratio < 1：当前收益比以前低，蒸馏价值在下降
-        # ratio > 1：当前收益比基线还高，蒸馏很有用
-        # ratio < 0：说明信息增益已经反向了，直接截成 0
-        baseline = max(self._distill_info_gain_baseline, 1e-8)
-        ratio = self._distill_info_gain_ema / baseline
-        ratio_pos = max(ratio, 0.0)
 
-        k = self.cfg.get("distill_itad_sigmoid_k", 3.0)         # k 大：曲线更陡，权重对 ratio 的变化更敏感，k 小：曲线更平，权重变化更柔和
-        raw_sig = 1.0 / (1.0 + math.exp(-k * (ratio_pos - 0.5)))
-        sig_floor = 1.0 / (1.0 + math.exp(k * 0.5))
-        sig_ceil  = 1.0 / (1.0 + math.exp(-k * 0.5))
-        smooth_ratio = (raw_sig - sig_floor) / (sig_ceil - sig_floor)
-        smooth_ratio = max(0.0, min(1.0, smooth_ratio))
+        # 信号未就绪时保持初始权重
+        if self._distill_avg_visible_gate is None or self._distill_avg_top1_agreement is None:
+            return self._distill_weight_init
 
-        # ------------------------------------------------------------------ #
-        # Cutoff：三个条件同时满足才把 smooth_ratio 归零
-        #   1. ratio 连续 N 次 update 接近 0（持续低信息增益）
-        #   2. 任务性能没有恶化（perf_fast >= perf_slow * (1 - tol)）
-        # ------------------------------------------------------------------ #
-        ratio_cutoff  = self.cfg.get("distill_itad_ratio_cutoff",  0.05)  # ratio 低于此值算"接近 0"
-        streak_n      = self.cfg.get("distill_itad_zero_streak_n", 10)    # 需要连续多少次 update
-        perf_drop_tol = self.cfg.get("distill_itad_perf_drop_tol", 0.05)  # 性能允许下降的容忍比例
+        # ITAD 核心公式：w = w_init × (1 - agreement) × visible_gate
+        #   visible_gate：teacher 信号在可见目标上的概率质量（teacher 信号可执行性）
+        #   1 - agreement：student 的学习缺口（agreement 越高说明学生越学会了，蒸馏价值越低）
+        visible_gate = max(0.0, min(1.0, self._distill_avg_visible_gate))
+        agreement    = max(0.0, min(1.0, self._distill_avg_top1_agreement))
+        incompetence = 1.0 - agreement
+        # w_anneal = self._distill_weight_init * incompetence * visible_gate
+        w_anneal = self._distill_weight_init * incompetence
 
-        # 条件 1：更新连续计数器
-        if ratio < ratio_cutoff:
+        # Cutoff：agreement 连续 N 次超过阈值则永久关闭蒸馏
+        agreement_cutoff = self.cfg.get("distill_itad_agreement_cutoff", 0.95)
+        streak_n         = self.cfg.get("distill_itad_zero_streak_n", 10)
+        if agreement >= agreement_cutoff:
             self._distill_zero_streak += 1
         else:
             self._distill_zero_streak = 0
-        # 条件 2：任务性能没有恶化
-        # perf_ok = True
-        # if (self._distill_perf_fast is not None and
-        #         self._distill_perf_slow is not None and
-        #         abs(self._distill_perf_slow) > 1e-6):
-        #     perf_ok = self._distill_perf_fast >= self._distill_perf_slow * (1.0 - perf_drop_tol)
-        # if self._distill_zero_streak >= streak_n and perf_ok:
-        #     return self._distill_weight_init
-        if self._distill_zero_streak >= streak_n:
-            self._distill_permanently_off = True
-            print(f"ITAD: 蒸馏权重永久关闭 (zero_streak={self._distill_zero_streak} >= {streak_n})")
-            return self._distill_weight_min
+        # if self._distill_zero_streak >= streak_n:
+        #     self._distill_permanently_off = True
+        #     print(f"ITAD: 蒸馏权重永久关闭 (agreement={agreement:.4f} >= {agreement_cutoff} 连续 {streak_n} 次)")
+        #     return self._distill_weight_min
 
-        # 信息增益高 -> smooth_ratio 大 -> w_anneal 接近初始蒸馏权重
-        # 信息增益低 -> smooth_ratio 小 -> w_anneal 接近最小蒸馏权重
-        w_anneal = self._distill_weight_init * (self._distill_weight_min + (1.0 - self._distill_weight_min) * smooth_ratio)
-        print(f"ITAD anneal: info_gain_ema={self._distill_info_gain_ema:.6f}, baseline={baseline:.6f}, ratio={ratio:.4f}, smooth_ratio={smooth_ratio:.4f}, w_anneal={w_anneal:.6f}")
-        # ---------- KL floor ----------
-        # FIXME：好像这个玩意有点问题
-        # student 越没学会，kl_gate 越大
-        # kl_gap > 0：student 和 teacher 还不够像，蒸馏不能退得太狠
-        # kl_gap < 0：student 已经学得比较像了，KL 保底可以放松
-        # if self._distill_kl_ema is not None:
-        #     kl_margin = self.cfg.get("distill_itad_kl_margin", 0.05)
-        #     kl_tau = self.cfg.get("distill_itad_kl_tau", 0.03)
-        #     kl_gap = self._distill_kl_ema - (self._distill_target_kl + kl_margin)
-        #     kl_gate = 1.0 / (1.0 + math.exp(-kl_gap / max(kl_tau, 1e-6)))
-        #     print(f"ITAD KL gate: kl_ema={self._distill_kl_ema:.6f}, kl_gap={kl_gap:.6f}, kl_gate={kl_gate:.4f}")
-        # else:
-        #     kl_gate = 1.0
-
-        # kl_floor_ratio = self.cfg.get("distill_itad_kl_floor_ratio", 0.25)
-        # w_kl_floor = self._distill_weight_init * (self._distill_weight_min + (kl_floor_ratio - self._distill_weight_min) * kl_gate)
-        # print(f"ITAD KL floor: kl_ema={self._distill_kl_ema:.6f}, kl_gate={kl_gate:.4f}, w_kl_floor={w_kl_floor:.6f}")
-        # w_base = max(w_anneal, w_kl_floor)
         w_base = w_anneal
-        # ---------- restore ----------
-        # restore_strength = 0.0
-        # perf_ready = (
-        #     self._distill_perf_fast is not None and
-        #     self._distill_perf_slow is not None and
-        #     self._distill_perf_best is not None and
-        #     abs(self._distill_perf_best) > 1e-6
-        # )
-
-        # if perf_ready:
-        #     fast_dropping = self._distill_perf_fast < self._distill_perf_slow                                        # 判断近期性能是否比长期均值更差
-        #     slow_drop = max(0.0 ,(self._distill_perf_best - self._distill_perf_slow) / abs(self._distill_perf_best)) # 当前慢性能相对历史最好性能掉了多少
-
-        #     plateau_eps = self.cfg.get("distill_itad_plateau_eps", 0.1)        # 这也是个经验值，得调。
-        #     plateau = abs(self._distill_perf_fast - self._distill_perf_slow) < plateau_eps
-
-        #     still_not_learned = (
-        #         self._distill_kl_ema is not None and
-        #         self._distill_kl_ema > self._distill_target_kl + self.cfg.get("distill_itad_kl_margin", 0.05)
-        #     )
-
-        #     anneal_decay = math.sqrt(w_base / max(self._distill_weight_init, 1e-8))
-        #     max_restore = self.cfg.get("distill_itad_max_restore_ratio", 0.3) * self._distill_weight_init
-
-        #     # A. regression restore
-        #     if fast_dropping and slow_drop > 0:
-        #         print(f"ITAD restore: fast_dropping={fast_dropping}, slow_drop={slow_drop:.4f}")
-        #         restore_k = self.cfg.get("distill_itad_restore_k", 4.0)
-        #         restore_threshold = self.cfg.get("distill_itad_restore_threshold", 0.05)
-        #         drop_gate = 1.0 / (1.0 + math.exp(-restore_k * (slow_drop - restore_threshold)))
-        #         restore_strength += drop_gate * anneal_decay * max_restore
-        #     # B. plateau restore
-        #     if plateau and still_not_learned:
-        #         print(f"ITAD restore: plateau={plateau}, still_not_learned={still_not_learned}")
-        #         print(f"ITAD restore details: perf_fast={self._distill_perf_fast:.6f}, perf_slow={self._distill_perf_slow:.6f}, perf_best={self._distill_perf_best:.6f}, kl_ema={self._distill_kl_ema:.6f}")
-        #         kl_restore_k = self.cfg.get("distill_itad_kl_restore_k", 8.0)
-        #         kl_tau = self.cfg.get("distill_itad_kl_tau", 0.03)
-        #         kl_gap = self._distill_kl_ema - (
-        #             self._distill_target_kl + self.cfg.get("distill_itad_kl_margin", 0.05)
-        #         )
-        #         plateau_gate = 1.0 / (1.0 + math.exp(-kl_restore_k * kl_gap / max(kl_tau, 1e-6)))
-        #         restore_strength += plateau_gate * anneal_decay * max_restore
 
         prev = self._cached_distill_weight
         # target_weight = min(self._distill_weight_init, w_base + restore_strength)
@@ -779,12 +761,76 @@ class IPPO(MultiAgent):
         max_up   = self.cfg.get("distill_itad_max_up_delta",   0.002) * self._distill_weight_init
 
         delta = target_weight - prev
-        # delta = max(-max_down, min(max_up, delta))
+        # 只限制下降速度，上升不限制（快速响应 teacher 信号变好或 student 退步）
+        delta = max(-max_down, delta)
         result = min(self._distill_weight_init, max(self._distill_weight_min, prev + delta))
         # 权重降到 min 后永久锁死
-        if result <= self._distill_weight_min:
-            self._distill_permanently_off = True
+        # if result <= self._distill_weight_min:
+        #     self._distill_permanently_off = True
         return result
+
+    def _update_release_schedule(self) -> float:
+        """单向 release 退火调度（每次 update 调用一次）。
+
+        三阶段：
+        1. warmup：beta = beta_init，固定不变
+        2. trigger 后：按 update 线性退火到 0
+        3. 退火结束：permanently_off=True，永久关闭
+
+        Returns:
+            当前 beta 值
+        """
+        if self._distill_weight_init <= 0:
+            return 0.0
+
+        # 已永久关闭
+        if self._distill_permanently_off:
+            return 0.0
+
+        # 已触发 release → 线性退火
+        if self._release_triggered:
+            self._release_update_count += 1
+            progress = min(1.0, self._release_update_count / max(self._release_anneal_updates, 1))
+            beta = self._distill_weight_init * (1.0 - progress)
+            if progress >= 1.0:
+                self._distill_permanently_off = True
+                beta = 0.0
+            return beta
+        
+        if self._release_mode is not None and self._release_mode == "success":
+            # 检查 trigger 条件（基于 success_rate_ema）
+            success_rate = self._distill_success_rate_ema
+            if success_rate is not None and success_rate >= self._release_success_threshold:
+                self._release_patience_counter += 1
+            else:
+                self._release_patience_counter = 0
+
+            if self._release_patience_counter >= self._release_patience_updates:
+                self._release_triggered = True
+                self._release_update_count = 0
+                logger.info(
+                    f"[DualTeacher] Release triggered! success_rate_ema={success_rate:.4f} >= "
+                    f"{self._release_success_threshold} for {self._release_patience_updates} updates. "
+                    f"Starting linear anneal over {self._release_anneal_updates} updates."
+                )
+        elif self._release_mode is not None and self._release_mode == "interception":
+            # 检查 trigger 条件（基于 interception_rate_ema）
+            interception_rate = self._distill_intercept_rate_ema
+            if interception_rate is not None and interception_rate >= self._release_interception_threshold:
+                self._release_patience_counter += 1
+            else:
+                self._release_patience_counter = 0
+
+            if self._release_patience_counter >= self._release_patience_updates:
+                self._release_triggered = True
+                self._release_update_count = 0
+                logger.info(
+                    f"[DualTeacher] Release triggered! interception_rate_ema={interception_rate:.4f} >= "
+                    f"{self._release_success_threshold} for {self._release_patience_updates} updates. "
+                    f"Starting linear anneal over {self._release_anneal_updates} updates."
+                )
+
+        return self._distill_weight_init
 
     def _extract_visibility_mask(self, policy, raw_states, target_dim):
         """从 raw_states 提取 visibility_mask [B, target_dim]。
@@ -835,8 +881,10 @@ class IPPO(MultiAgent):
             return gate, has_visible
 
         vis_f = visibility_mask.to(teacher_probs.dtype)
-        visible_mass = (teacher_probs * vis_f).sum(dim=-1).clamp(min=0.0, max=1.0)  # [B]
-        has_visible = visible_mass > 1e-8
+        # has_visible: 该样本是否有至少一个可见目标（基于 mask 本身，不依赖 teacher 概率质量）
+        # 这样即使 teacher 全零（训练初期 Sinkhorn 未收敛），有可见目标的样本仍参与蒸馏
+        has_visible = visibility_mask.any(dim=-1)  # [B] bool
+        visible_mass = (teacher_probs * vis_f).sum(dim=-1).clamp(min=0.0, max=1.0)  # [B] gate
         return visible_mass.detach(), has_visible
 
     def act(self, states: Mapping[str, torch.Tensor], timestep: int, timesteps: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -973,10 +1021,23 @@ class IPPO(MultiAgent):
                 }
 
                 # distillation: store optimal assignment per agent
-                if self._distill_weight_init > 0 and self._optimal_assignment_sorted is not None:
+                if self._distill_weight_init > 0:
                     agent_idx = self.possible_agents.index(uid)
-                    # _optimal_assignment_sorted: [N, M, K_target] → take agent_idx slice → [N, K_target]
-                    memory_samples["optimal_assignment"] = self._optimal_assignment_sorted[:, agent_idx, :]
+                    if self._dual_teacher_enable:
+                        # 始终写入（即使 teacher 是 None 也写全零），避免 memory 初始 NaN 残留
+                        N = list(states.values())[0].shape[0]
+                        K = self._distill_num_targets
+                        dev = list(states.values())[0].device
+                        g_slice = (self._global_assignment_sorted[:, agent_idx, :]
+                                   if self._global_assignment_sorted is not None
+                                   else torch.zeros(N, K, device=dev))
+                        l_slice = (self._local_assignment_sorted[:, agent_idx, :]
+                                   if self._local_assignment_sorted is not None
+                                   else torch.zeros(N, K, device=dev))
+                        memory_samples["global_assignment"] = g_slice
+                        memory_samples["local_assignment"] = l_slice
+                    elif self._optimal_assignment_sorted is not None:
+                        memory_samples["optimal_assignment"] = self._optimal_assignment_sorted[:, agent_idx, :]
 
                 self.memories[uid].add_samples(**memory_samples)
 
@@ -1126,6 +1187,7 @@ class IPPO(MultiAgent):
         cumulative_raw_kl = 0.0               # 原始KL散度（未加权）
         cumulative_visible_gate = 0.0         # 可见性门控均值（teacher 在可见集合上的概率质量）
         cumulative_top1_agreement = 0.0       # teacher 和 student 的 top1 一致率
+        cumulative_js_teacher = 0.0           # teacher-teacher JS divergence（仅日志，不反传）
         distill_count = 0                   # 实际计算了KL的batch数
         _entropy_accum = None
         _entropy_accum_count = 0
@@ -1140,7 +1202,20 @@ class IPPO(MultiAgent):
             for batch in sampled_batches_all:
 
                 sampled_optimal_assignment = None
-                if self._distill_weight_init > 0 and len(batch) == 7:
+                sampled_global_assignment = None
+                sampled_local_assignment = None
+                if self._distill_weight_init > 0 and self._dual_teacher_enable and len(batch) == 8:
+                    (
+                        sampled_states,
+                        sampled_actions,
+                        sampled_log_prob,
+                        sampled_values,
+                        sampled_returns,
+                        sampled_advantages,
+                        sampled_global_assignment,
+                        sampled_local_assignment,
+                    ) = batch
+                elif self._distill_weight_init > 0 and len(batch) == 7:
                     (
                         sampled_states,
                         sampled_actions,
@@ -1247,182 +1322,212 @@ class IPPO(MultiAgent):
                         )
                     value_loss = self._value_loss_scale[agent_0] * F.mse_loss(sampled_returns, predicted_values)
 
-                    # compute distillation loss (Sinkhorn optimal assignment → attention assignment)
-                    # 让 student 的分配分布更接近 teacher（在可见目标子集上）
-                    # ---------------- global teacher distillation loss ----------------
+                    # ---- distillation loss ----
                     distill_loss = 0
-                    if self._distill_weight_init > 0 and sampled_optimal_assignment is not None:
-                        # get current assignment_probs from cached policy output
+                    raw_kl_val = torch.tensor(0.0)
+                    batch_visible_gate = None
+                    batch_top1_agreement = 0.0
+                    valid_samples = None
+
+                    if self._distill_weight_init > 0 and self._cached_distill_weight > 0:
                         assignment_probs = getattr(policy, '_assignment_probs_cache', None)
                         if assignment_probs is not None:
-                            # KL divergence: target distribution (Sinkhorn) vs learned distribution
-                            target = sampled_optimal_assignment  # [B, K_target] teacher 给的"目标分配概率"
-                            pred = assignment_probs              # [B, E] student 的分配概率
+                            pred = assignment_probs  # [B, E]
 
-                            # Handle dimension mismatch (K_target != E)
-                            K_target = target.shape[-1]
-                            E = pred.shape[-1]
+                            if self._dual_teacher_enable and sampled_global_assignment is not None and sampled_local_assignment is not None:
+                                # ---- dual-teacher distillation ----
+                                def _align_and_norm(t, E):
+                                    """Align teacher tensor to student dim E and normalize.
+                                    Zero rows (no valid targets) stay zero — not normalized to uniform."""
+                                    K = t.shape[-1]
+                                    if K < E:
+                                        pad = torch.zeros(t.shape[0], E - K, device=t.device, dtype=t.dtype)
+                                        t = torch.cat([t, pad], dim=-1)
+                                    elif K > E:
+                                        t = t[:, :E]
+                                    t = torch.nan_to_num(t, nan=0.0)  # 清除 NaN
+                                    s = t.sum(dim=-1, keepdim=True)
+                                    has_mass = (s > 1e-8)             # [B, 1] bool：有有效概率质量
+                                    t = torch.where(has_mass, t / s.clamp(min=1e-8), torch.zeros_like(t))
+                                    return t
 
-                            if K_target != E:
-                                logger.warning(
-                                    f"Dimension mismatch in distillation: K_target={K_target}, E={E}. "
-                                    f"This should not happen if config is correct (num_targets should equal obs_k_target). "
-                                    f"Applying fallback padding/truncation, but this may cause information loss."
+                                def _kl_div(p, q):
+                                    """KL(p || q) where p is teacher, q is student. Both [B, E].
+                                    Zero rows in p contribute 0 (no teacher signal for that sample)."""
+                                    log_p = torch.log(p + 1e-8)
+                                    log_q = torch.log(q + 1e-8)
+                                    return (p * (log_p - log_q)).sum(dim=-1)  # [B]
+
+                                E = pred.shape[-1]
+                                # guard: student probs may contain NaN at training start
+                                pred_safe = torch.nan_to_num(pred, nan=0.0)
+                                pred_safe = pred_safe.clamp(min=0.0)
+                                pred_sum = pred_safe.sum(dim=-1, keepdim=True)
+                                pred_safe = torch.where(
+                                    pred_sum > 1e-8,
+                                    pred_safe / pred_sum.clamp(min=1e-8),
+                                    torch.ones_like(pred_safe) / E,
                                 )
-                                if K_target < E:
-                                    # Pad target with zeros
-                                    pad_size = E - K_target
-                                    pad = torch.zeros(target.shape[0], pad_size, device=target.device, dtype=target.dtype)
-                                    target = torch.cat([target, pad], dim=-1)
+
+                                g_raw = _align_and_norm(sampled_global_assignment, E)  # [B, E]
+                                l_raw = _align_and_norm(sampled_local_assignment, E)   # [B, E]
+
+                                # visibility gate on global teacher (same logic as single-teacher path)
+                                visibility_mask = self._extract_visibility_mask(policy, raw_states, E)
+                                if visibility_mask is not None:
+                                    vis_f = visibility_mask.to(pred_safe.dtype)
+                                    visible_gate, valid_samples = self._compute_visible_mass_gate(g_raw, visibility_mask)
+                                    valid_f = valid_samples.to(pred_safe.dtype)
+                                    denom = valid_f.sum().clamp(min=1.0)
+
+                                    # skip if no valid samples (no visible targets in entire batch)
+                                    if valid_f.sum() < 1.0:
+                                        distill_loss = torch.tensor(0.0, device=pred.device)
+                                    else:
+                                        # G_vis: global teacher masked to visible targets
+                                        g_vis = g_raw * vis_f
+                                        g_vis_sum = g_vis.sum(dim=-1, keepdim=True)
+                                        g_vis = torch.where(g_vis_sum > 1e-8, g_vis / g_vis_sum.clamp(min=1e-8), torch.zeros_like(g_vis))
+                                        g_vis = g_vis * valid_f.unsqueeze(-1)
+
+                                        # L: local teacher (already visibility-aware by construction)
+                                        l_vis = l_raw * valid_f.unsqueeze(-1)
+
+                                        # consensus teacher C = normalize(eta * G_vis + (1-eta) * L)
+                                            # eta 大，说明更相信 global teacher
+                                            # eta 小，说明更相信 local teacher
+                                        eta = self._distill_eta_consensus
+                                        c_mix = eta * g_vis + (1.0 - eta) * l_vis
+                                        c_sum = c_mix.sum(dim=-1, keepdim=True)
+                                        c_vis = torch.where(c_sum > 1e-8, c_mix / c_sum.clamp(min=1e-8), torch.zeros_like(c_mix))
+                                        c_vis = c_vis * valid_f.unsqueeze(-1)
+
+                                        # student gated to visible
+                                        pred_vis = pred_safe * vis_f
+                                        pred_vis_sum = pred_vis.sum(dim=-1, keepdim=True)
+                                        pred_vis = torch.where(
+                                            pred_vis_sum > 1e-8,
+                                            pred_vis / pred_vis_sum.clamp(min=1e-8),
+                                            torch.ones_like(pred_vis) / E,
+                                        )
+                                        pred_vis = pred_vis * valid_f.unsqueeze(-1)
+
+                                        alpha = self._distill_alpha_global
+                                        lam_c = self._distill_lambda_consistency
+
+                                        kl_g = _kl_div(g_vis, pred_vis)   # KL(G_vis || S)让学生像 global teacher
+                                        kl_l = _kl_div(l_vis, pred_vis)   # KL(L || S)让学生像 local teacher
+                                        kl_c = _kl_div(c_vis, pred_vis)   # KL(C || S)让学生像“这两个老师的折中意见”
+
+                                        per_sample_dual = alpha * kl_g + (1.0 - alpha) * kl_l + lam_c * kl_c
+                                        raw_kl_val = (per_sample_dual * valid_f).sum() / denom
+                                        # visible_gate 只作监控，不乘进 loss
+                                        weighted_kl_val = raw_kl_val
+                                        batch_visible_gate = (visible_gate * valid_f).sum() / denom
+
+                                        with torch.no_grad():
+                                            m_tt = 0.5 * (g_vis + l_vis)
+                                            m_tt_sum = m_tt.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                                            m_tt = m_tt / m_tt_sum * valid_f.unsqueeze(-1)
+                                            # js_tt = 0.5 * (_kl_div(m_tt, g_vis) + _kl_div(m_tt, l_vis))
+                                            js_tt = 0.5 * (_kl_div(g_vis, m_tt) + _kl_div(l_vis, m_tt))
+                                            batch_js_teacher = (js_tt * valid_f).sum() / denom
+
+                                            teacher_top1 = (g_vis * vis_f).argmax(dim=-1)
+                                            student_top1 = (pred_vis * vis_f).argmax(dim=-1)
+                                            top1_match = (teacher_top1 == student_top1).to(pred.dtype)
+                                            batch_top1_agreement = (top1_match * valid_f).sum() / denom
+
+                                        distill_loss = self._cached_distill_weight * weighted_kl_val
                                 else:
-                                    # Truncate target to match E
-                                    target = target[:, :E]
-
-                            # normalize target to valid distribution (may not sum to 1 due to masking)
-                            target_sum = target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                            target = target / target_sum
-
-                            # 可见性门控蒸馏：只对可见目标计算 KL
-                            visibility_mask = self._extract_visibility_mask(
-                                policy, raw_states, target.shape[-1]
-                            )
-
-                            batch_visible_gate = None
-                            if visibility_mask is not None:
-                                vis_f = visibility_mask.to(target.dtype)
-
-                                # teacher 在可见集合上的总概率质量，作为样本级门控
-                                visible_gate, valid_samples = self._compute_visible_mass_gate(target, visibility_mask)
-                                valid_f = valid_samples.to(target.dtype)
-
-                                # mask teacher：不可见目标清零后，只在可见集合内归一化
-                                target_visible = target * vis_f
-                                tg_sum = target_visible.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                                target_gated = target_visible / tg_sum
-                                target_gated = target_gated * valid_f.unsqueeze(-1)
-
-                                # mask student：同样只保留可见目标后归一化
-                                pred_visible = pred * vis_f
-                                pg_sum = pred_visible.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                                pred_gated = pred_visible / pg_sum
-                                pred_gated = pred_gated * valid_f.unsqueeze(-1)
-
-                                # 逐样本 KL
-                                log_pred_g = torch.log(pred_gated + 1e-8)
-                                log_target_g = torch.log(target_gated + 1e-8)
-                                per_sample_kl = (target_gated * (log_target_g - log_pred_g)).sum(dim=-1)
-
-                                denom = valid_f.sum().clamp(min=1.0)
-                                raw_kl_val = (per_sample_kl * valid_f).sum() / denom
-
-                                # 真正反传的 KL：再乘 teacher 可见质量门控
-                                weighted_kl_val = (per_sample_kl * visible_gate * valid_f).sum() / denom
-                                batch_visible_gate = (visible_gate * valid_f).sum() / denom
-
-                                # 计算 teacher 和 student 的 top1 一致率（只在可见目标上比较）
-                                # target_visible 和 pred_visible 都是在距离排序后的槽位空间上，索引对齐
-                                with torch.no_grad():
-                                    teacher_top1 = (target_visible * vis_f).argmax(dim=-1)  # [B] teacher top1: 在可见目标上找最大概率的索引（槽位）
-                                    student_top1 = (pred_visible * vis_f).argmax(dim=-1)    # [B] student top1: 在可见目标上找最大概率的索引（槽位）
-                                    top1_match = (teacher_top1 == student_top1).to(target.dtype)  # [B]
-                                    batch_top1_agreement = (top1_match * valid_f).sum() / denom
-                            else:
-                                # fallback：无可见性信息时用原始 KL
-                                log_pred = torch.log(pred + 1e-8)
-                                log_target = torch.log(target + 1e-8)
-                                raw_kl_val = (target * (log_target - log_pred)).sum(dim=-1).mean()
-                                weighted_kl_val = raw_kl_val
-                                batch_visible_gate = torch.tensor(1.0, device=pred.device)
-                                valid_samples = torch.ones(pred.shape[0], device=pred.device, dtype=torch.bool)
-
-                                # 计算 top1 一致率（无可见性mask时全局比较）
-                                with torch.no_grad():
-                                    teacher_top1 = target.argmax(dim=-1)  # [B]
-                                    student_top1 = pred.argmax(dim=-1)    # [B]
-                                    batch_top1_agreement = (teacher_top1 == student_top1).float().mean()
-
-                            # 使用缓存的权重（上一次update结束时计算的，不更新EMA）
-                            distill_loss = self._cached_distill_weight * weighted_kl_val
-
-                            # 累积 entropy 用于 ITAD（复用 visibility_mask，对齐 KL 的可见性门控）
-                            if self._distill_anneal_type in ("itad", "itad_v2"):
-                                _cache = getattr(policy, '_assignment_probs_cache', None)
-                                if _cache is not None:
+                                    # fallback: no visibility mask
+                                    eta = self._distill_eta_consensus
+                                    c_mix = eta * g_raw + (1.0 - eta) * l_raw
+                                    c_raw = c_mix / c_mix.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                                    alpha = self._distill_alpha_global
+                                    lam_c = self._distill_lambda_consistency
+                                    kl_g = _kl_div(g_raw, pred_safe)
+                                    kl_l = _kl_div(l_raw, pred_safe)
+                                    kl_c = _kl_div(c_raw, pred_safe)
+                                    per_sample_dual = alpha * kl_g + (1.0 - alpha) * kl_l + lam_c * kl_c
+                                    raw_kl_val = per_sample_dual.mean()
+                                    weighted_kl_val = raw_kl_val
+                                    batch_visible_gate = torch.tensor(1.0, device=pred.device)
+                                    valid_samples = torch.ones(pred.shape[0], device=pred.device, dtype=torch.bool)
                                     with torch.no_grad():
-                                        p = _cache.detach()  # [B, E]
-                                        if visibility_mask is not None:
-                                            vis = visibility_mask.to(p.dtype)
-                                            p = p * vis
-                                            p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                                            k_vis = vis.sum(dim=-1).clamp(min=1.0)
-                                            norm = torch.log(k_vis).clamp(min=1e-6)
-                                            valid_f = valid_samples.to(p.dtype)
-                                            e_sample = -(p * torch.log(p.clamp(min=1e-8))).sum(dim=-1) / norm
-                                            e = (e_sample * valid_f).sum() / valid_f.sum().clamp(min=1.0)
-                                        else:
-                                            e = -(p * torch.log(p.clamp(min=1e-8))).sum(dim=-1).mean()
-                                        _entropy_accum = e if _entropy_accum is None else (_entropy_accum + e)
-                                        _entropy_accum_count += 1
-                    # ---------------- global teacher distillation loss ----------------
+                                        batch_js_teacher = torch.tensor(0.0, device=pred.device)
+                                        batch_top1_agreement = (g_raw.argmax(-1) == pred_safe.argmax(-1)).float().mean()
+                                    distill_loss = self._cached_distill_weight * weighted_kl_val
 
-                    # ---------------- local teacher distillation loss ----------------
-                    # distill_loss = 0
-                    # if self._distill_weight_init > 0 and sampled_optimal_assignment is not None:
-                    #     assignment_probs = getattr(policy, '_assignment_probs_cache', None)
-                    #     if assignment_probs is not None:
-                    #         target_l = sampled_optimal_assignment  # [B, K_target]，无效槽位已为 0
-                    #         pred_l = assignment_probs              # [B, E]
-                    
-                    #         # 维度对齐
-                    #         K_l, E_l = target_l.shape[-1], pred_l.shape[-1]
-                    #         if K_l != E_l:
-                    #             if K_l < E_l:
-                    #                 pad = torch.zeros(target_l.shape[0], E_l - K_l,
-                    #                                   device=target_l.device, dtype=target_l.dtype)
-                    #                 target_l = torch.cat([target_l, pad], dim=-1)
-                    #             else:
-                    #                 target_l = target_l[:, :E_l]
-                    
-                    #         # 有效槽位 mask（局部 teacher 无效槽位已是硬零，直接用阈值判断）
-                    #         valid_mask_l = (target_l > 1e-8)                          # [B, E]
-                    #         has_valid_l = valid_mask_l.any(dim=-1, keepdim=True).to(target_l.dtype)  # [B, 1]
-                    
-                    #         # 归一化 teacher（防御性，局部 teacher 已归一化但以防万一）
-                    #         t_sum_l = target_l.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                    #         target_l = target_l / t_sum_l * has_valid_l
-                    
-                    #         # 对齐 student：只保留 teacher 有概率的槽位后归一化
-                    #         pred_l_masked = pred_l * valid_mask_l.to(pred_l.dtype)
-                    #         p_sum_l = pred_l_masked.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                    #         pred_l_masked = pred_l_masked / p_sum_l * has_valid_l
-                    
-                    #         # 逐样本 KL，只对有有效目标的样本求均值
-                    #         log_pred_l = torch.log(pred_l_masked + 1e-8)
-                    #         log_target_l = torch.log(target_l + 1e-8)
-                    #         per_sample_kl_l = (target_l * (log_target_l - log_pred_l)).sum(dim=-1)
-                    #         valid_samples_l = has_valid_l.squeeze(-1)
-                    #         if valid_samples_l.sum() > 0:
-                    #             raw_kl_val = (per_sample_kl_l * valid_samples_l).sum() / valid_samples_l.sum()
-                    #         else:
-                    #             raw_kl_val = torch.tensor(0.0, device=pred_l.device)
-                    
-                    #         distill_loss = self._cached_distill_weight * raw_kl_val
-                    
-                    #         # entropy 累积（ITAD 用，以有效槽位数归一化）
-                    #         if self._distill_anneal_type in ("itad", "itad_v2"):
-                    #             _cache = getattr(policy, '_assignment_probs_cache', None)
-                    #             if _cache is not None:
-                    #                 with torch.no_grad():
-                    #                     p = _cache.detach()
-                    #                     p = p * valid_mask_l.to(p.dtype)
-                    #                     p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-                    #                     k_vis = valid_mask_l.to(p.dtype).sum(dim=-1).clamp(min=1.0)
-                    #                     norm = torch.log(k_vis).clamp(min=1e-6)
-                    #                     e = -(p * torch.log(p.clamp(min=1e-8))).sum(dim=-1) / norm
-                    #                     e = e.mean()
-                    #                     _entropy_accum = e if _entropy_accum is None else (_entropy_accum + e)
-                    #                     _entropy_accum_count += 1
-                    # ---------------- local teacher distillation loss ----------------
+                            elif not self._dual_teacher_enable and sampled_optimal_assignment is not None:
+                                # ---- single-teacher path (original logic preserved) ----
+                                target = sampled_optimal_assignment
+                                K_target, E = target.shape[-1], pred.shape[-1]
+                                if K_target != E:
+                                    if K_target < E:
+                                        pad = torch.zeros(target.shape[0], E - K_target, device=target.device, dtype=target.dtype)
+                                        target = torch.cat([target, pad], dim=-1)
+                                    else:
+                                        target = target[:, :E]
+                                target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+                                visibility_mask = self._extract_visibility_mask(policy, raw_states, target.shape[-1])
+                                batch_js_teacher = torch.tensor(0.0)
+
+                                if visibility_mask is not None:
+                                    vis_f = visibility_mask.to(target.dtype)
+                                    visible_gate, valid_samples = self._compute_visible_mass_gate(target, visibility_mask)
+                                    valid_f = valid_samples.to(target.dtype)
+                                    target_visible = target * vis_f
+                                    tg_sum = target_visible.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                                    target_gated = target_visible / tg_sum * valid_f.unsqueeze(-1)
+                                    pred_visible = pred * vis_f
+                                    pg_sum = pred_visible.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                                    pred_gated = pred_visible / pg_sum * valid_f.unsqueeze(-1)
+                                    log_pred_g = torch.log(pred_gated + 1e-8)
+                                    log_target_g = torch.log(target_gated + 1e-8)
+                                    per_sample_kl = (target_gated * (log_target_g - log_pred_g)).sum(dim=-1)
+                                    denom = valid_f.sum().clamp(min=1.0)
+                                    raw_kl_val = (per_sample_kl * valid_f).sum() / denom
+                                    weighted_kl_val = raw_kl_val  # visible_gate 只作监控，不乘进 loss
+                                    batch_visible_gate = (visible_gate * valid_f).sum() / denom
+                                    with torch.no_grad():
+                                        teacher_top1 = (target_visible * vis_f).argmax(dim=-1)
+                                        student_top1 = (pred_visible * vis_f).argmax(dim=-1)
+                                        top1_match = (teacher_top1 == student_top1).to(target.dtype)
+                                        batch_top1_agreement = (top1_match * valid_f).sum() / denom
+                                else:
+                                    log_pred = torch.log(pred + 1e-8)
+                                    log_target = torch.log(target + 1e-8)
+                                    raw_kl_val = (target * (log_target - log_pred)).sum(dim=-1).mean()
+                                    weighted_kl_val = raw_kl_val
+                                    batch_visible_gate = torch.tensor(1.0, device=pred.device)
+                                    valid_samples = torch.ones(pred.shape[0], device=pred.device, dtype=torch.bool)
+                                    with torch.no_grad():
+                                        batch_top1_agreement = (target.argmax(-1) == pred.argmax(-1)).float().mean()
+
+                                distill_loss = self._cached_distill_weight * weighted_kl_val
+
+                                # entropy accumulation for ITAD
+                                if self._distill_anneal_type in ("itad", "itad_v2"):
+                                    _cache = getattr(policy, '_assignment_probs_cache', None)
+                                    if _cache is not None:
+                                        with torch.no_grad():
+                                            p = _cache.detach()
+                                            if visibility_mask is not None:
+                                                vis = visibility_mask.to(p.dtype)
+                                                p = p * vis
+                                                p = p / p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                                                k_vis = vis.sum(dim=-1).clamp(min=1.0)
+                                                norm = torch.log(k_vis).clamp(min=1e-6)
+                                                valid_f_e = valid_samples.to(p.dtype)
+                                                e_sample = -(p * torch.log(p.clamp(min=1e-8))).sum(dim=-1) / norm
+                                                e = (e_sample * valid_f_e).sum() / valid_f_e.sum().clamp(min=1.0)
+                                            else:
+                                                e = -(p * torch.log(p.clamp(min=1e-8))).sum(dim=-1).mean()
+                                            _entropy_accum = e if _entropy_accum is None else (_entropy_accum + e)
+                                            _entropy_accum_count += 1
+                    # ---- end distillation loss ----
                 # optimization step
                 self.optimizers[agent_0].zero_grad()
                 total_loss = policy_loss + entropy_loss + value_loss + assignment_reg_loss + distill_loss
@@ -1457,14 +1562,18 @@ class IPPO(MultiAgent):
                         cumulative_assignment_reg_loss += float(assignment_reg_loss)
                 if isinstance(distill_loss, torch.Tensor):
                     cumulative_distill_loss += distill_loss.item()
-                    cumulative_raw_kl += raw_kl_val.item()
+                    cumulative_raw_kl += raw_kl_val.item() if isinstance(raw_kl_val, torch.Tensor) else float(raw_kl_val)
                     if batch_visible_gate is not None:
-                        cumulative_visible_gate += batch_visible_gate.item()
-                    if 'batch_top1_agreement' in locals():
-                        if isinstance(batch_top1_agreement, torch.Tensor):
-                            cumulative_top1_agreement += batch_top1_agreement.item()
+                        cumulative_visible_gate += batch_visible_gate.item() if isinstance(batch_visible_gate, torch.Tensor) else float(batch_visible_gate)
+                    if isinstance(batch_top1_agreement, torch.Tensor):
+                        cumulative_top1_agreement += batch_top1_agreement.item()
+                    else:
+                        cumulative_top1_agreement += float(batch_top1_agreement)
+                    if self._dual_teacher_enable and 'batch_js_teacher' in locals():
+                        if isinstance(batch_js_teacher, torch.Tensor):
+                            cumulative_js_teacher += batch_js_teacher.item()
                         else:
-                            cumulative_top1_agreement += batch_top1_agreement
+                            cumulative_js_teacher += float(batch_js_teacher)
                     distill_count += 1
 
             # update learning rate
@@ -1506,27 +1615,40 @@ class IPPO(MultiAgent):
             avg_entropy = None
             if self._distill_anneal_type in ("itad", "itad_v2") and _entropy_accum is not None and _entropy_accum_count > 0:
                 avg_entropy = (_entropy_accum / _entropy_accum_count).item()
+
+            avg_visible_gate = cumulative_visible_gate / max(distill_count, 1)
+            avg_top1_agreement = cumulative_top1_agreement / max(distill_count, 1)
+            avg_js_teacher = cumulative_js_teacher / max(distill_count, 1)
+
             if distill_count > 0:
-                self._update_distill_ema(avg_raw_kl, avg_entropy)
+                self._update_distill_ema(avg_raw_kl, avg_entropy,
+                                         avg_visible_gate=avg_visible_gate,
+                                         avg_top1_agreement=avg_top1_agreement)
 
             delta = timestep - self._distill_last_trainer_timestep
             self._distill_total_timestep += max(delta, 0)
             self._distill_last_trainer_timestep = timestep
-            self._cached_distill_weight = self._compute_distill_weight()
 
-            avg_visible_gate = cumulative_visible_gate / max(distill_count, 1)
-            avg_top1_agreement = cumulative_top1_agreement / max(distill_count, 1)
+            # dual-teacher: use release schedule; single-teacher: use existing _compute_distill_weight
+            if self._dual_teacher_enable:
+                self._cached_distill_weight = self._update_release_schedule()
+            else:
+                self._cached_distill_weight = self._compute_distill_weight()
 
-            self.track_data(f"Distillation / Distillation loss (raw KL)", avg_raw_kl) # teacher 和 student 分配分布的 真实差距（纯 KL），不乘权重。student 当前跟 teacher 像不像（越小越像）。
-            self.track_data(f"Distillation / Distillation loss (weighted)", avg_weighted_loss) # 真正加进你 total_loss 里参与反向传播的蒸馏损失项。蒸馏这一项在总 loss 里到底贡献了多大（梯度强不强）
+            self.track_data(f"Distillation / Distillation loss (raw KL)", avg_raw_kl)
+            self.track_data(f"Distillation / Distillation loss (weighted)", avg_weighted_loss)
             self.track_data(f"Distillation / Visible mass gate", avg_visible_gate)
-            self.track_data(f"Distillation / Top1 agreement", avg_top1_agreement)  # teacher 和 student 的 top1 选择一致率，越高说明学生越学会了老师的决策偏好
+            self.track_data(f"Distillation / Top1 agreement", avg_top1_agreement)
             self.track_data(f"Distillation / Distillation weight", self._cached_distill_weight)
+
+            if self._dual_teacher_enable:
+                # teacher-teacher JS divergence: monitoring metric only, no gradient
+                    # 值小：两个 teacher 给的分配很接近
+                    # 值大：两个 teacher 分歧比较大
+                self.track_data(f"Distillation / Teacher-Teacher JS", avg_js_teacher)
 
             if self._distill_kl_ema is not None:
                 self.track_data(f"Distillation / KL EMA", self._distill_kl_ema)             # KL EMA大说明学生和老师的差距大
-            if self._distill_target_kl > 0:
-                self.track_data(f"Distillation / Target KL", self._distill_target_kl)
 
             # ITAD 额外指标
             # Distillation / Info Gain EMA
@@ -1570,6 +1692,12 @@ class IPPO(MultiAgent):
                     self.track_data(f"Distillation / Intercept Rate EMA", self._distill_intercept_rate_ema)
                 if self._distill_success_rate_ema is not None:
                     self.track_data(f"Distillation / Success Rate EMA", self._distill_success_rate_ema)
+
+            # dual-teacher: also log success_rate_ema for release trigger monitoring
+            if self._dual_teacher_enable and self._distill_success_rate_ema is not None:
+                self.track_data(f"Distillation / Success Rate EMA", self._distill_success_rate_ema)
+            if self._dual_teacher_enable and self._distill_intercept_rate_ema is not None:
+                self.track_data(f"Distillation / Intercept Rate EMA", self._distill_intercept_rate_ema)
 
         self.track_data(f"Learning / Standard deviation", policy.distribution(role="policy").stddev.mean().item())
         self.track_data(f"Learning / Explained variance", explained_var)

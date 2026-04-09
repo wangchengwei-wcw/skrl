@@ -501,6 +501,7 @@ class AssignmentGaussianModel(GaussianMixin, Model):
         # 归一化空间距离（与 teammate_target_pos 同一空间，用于协同比较）
         target_dist_norm = torch.norm(target_rel_pos, dim=-1, keepdim=True)  # [B, E, 1]
 
+        # NOTE:这里喂给valuenet的target_dist没有做归一化，发现未做归一化的距离放进去效果更好
         # V 特征：自身视角，7 维 [rel_pos, rel_vel, dist]
         target_features_v = torch.cat([
             target_rel_pos,  # [B, E, 3]
@@ -574,8 +575,21 @@ class AssignmentGaussianModel(GaussianMixin, Model):
         # Cache assignment probs
         self._assignment_probs_cache = assignment_probs
 
+        # LayerNorm 对全零输入（所有目标无效时 context/assignment_feats 被置零）会产生 NaN，
+        # 因为方差为 0 导致除以 0。修复：全零行临时替换为常数向量，LayerNorm 后再清零。
+        if target_valid is not None:
+            has_valid_ln = target_valid.any(dim=-1).to(context.dtype).unsqueeze(-1)  # [B, 1]
+            # 全零行替换为 1.0（任意非零常数，让 LayerNorm 有非零方差）
+            context_ln = torch.where(has_valid_ln > 0, context, torch.ones_like(context))
+            feats_ln   = torch.where(has_valid_ln > 0, assignment_feats, torch.ones_like(assignment_feats))
+            context_normed = self.context_norm(context_ln) * has_valid_ln
+            feats_normed   = self.assignment_feats_norm(feats_ln) * has_valid_ln
+        else:
+            context_normed = self.context_norm(context)
+            feats_normed   = self.assignment_feats_norm(assignment_feats)
+
         # Augment observations: [original_obs, context, assignment_feats]
-        aug_obs = torch.cat([states, self.context_norm(context), self.assignment_feats_norm(assignment_feats)], dim=-1)
+        aug_obs = torch.cat([states, context_normed, feats_normed], dim=-1)
 
         # Generate mean actions through control MLP
         mean_actions = self.control_net(aug_obs)

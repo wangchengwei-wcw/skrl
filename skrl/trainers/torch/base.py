@@ -433,6 +433,11 @@ class Trainer:
                 target_env = self.env._unwrapped if hasattr(self.env, '_unwrapped') else self.env
                 if hasattr(target_env, '_optimal_assignment_sorted') and hasattr(self.agents, '_optimal_assignment_sorted'):
                     self.agents._optimal_assignment_sorted = target_env._optimal_assignment_sorted
+                # Sync dual teacher tensors (global + local) for dual-teacher distillation
+                if hasattr(target_env, '_global_assignment_sorted') and hasattr(self.agents, '_global_assignment_sorted'):
+                    self.agents._global_assignment_sorted = target_env._global_assignment_sorted
+                if hasattr(target_env, '_local_assignment_sorted') and hasattr(self.agents, '_local_assignment_sorted'):
+                    self.agents._local_assignment_sorted = target_env._local_assignment_sorted
 
                 # render scene
                 if not self.headless:
