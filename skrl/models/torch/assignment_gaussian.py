@@ -506,7 +506,7 @@ class AssignmentGaussianModel(GaussianMixin, Model):
         target_features_v = torch.cat([
             target_rel_pos,  # [B, E, 3]
             target_rel_vel,  # [B, E, 3]
-            target_dist,     # [B, E, 1]
+            target_dist_norm,     # [B, E, 1]
         ], dim=-1)  # [B, E, 7]
 
         # K 特征：加入协同信息，12 维
